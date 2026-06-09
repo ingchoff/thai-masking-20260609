@@ -4,6 +4,23 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
+VALID_JOB_TYPES = ("masking", "transcription", "transcription_secondary")
+TRANSCRIPTION_JOB_TYPES = ("transcription", "transcription_secondary")
+
+
+def _job_type_filter_sql(job_type: Optional[Any]) -> tuple[str, list[Any]]:
+    if job_type is None:
+        return "", []
+    if isinstance(job_type, str):
+        return " AND job_type = ?", [job_type]
+
+    job_types = list(job_type)
+    if not job_types:
+        return "", []
+
+    placeholders = ",".join("?" * len(job_types))
+    return f" AND job_type IN ({placeholders})", job_types
+
 # Custom exception classes for database operations
 class DatabaseError(Exception):
     """Base exception for database errors."""
@@ -84,7 +101,7 @@ def init_db():
             local_dest_dir TEXT,
             download_status TEXT CHECK(download_status IN ('pending', 'downloading', 'completed', 'failed')) DEFAULT 'pending',
             upload_status TEXT CHECK(upload_status IN ('pending', 'uploading', 'completed', 'failed')) DEFAULT 'pending',
-            job_type TEXT CHECK(job_type IN ('masking', 'transcription')) DEFAULT 'masking'
+            job_type TEXT CHECK(job_type IN ('masking', 'transcription', 'transcription_secondary')) DEFAULT 'masking'
         )
         ''')
 
@@ -111,9 +128,8 @@ def insert_job(task_id: int, track_id: int, source_path: str, dest_path: str, de
         JobInsertError: If job insertion fails
         DatabaseConnectionError: If database connection fails
     """
-    valid_job_types = ("masking", "transcription")
-    if job_type not in valid_job_types:
-        raise JobInsertError(f"Invalid job_type: {job_type}. Must be one of: {', '.join(valid_job_types)}")
+    if job_type not in VALID_JOB_TYPES:
+        raise JobInsertError(f"Invalid job_type: {job_type}. Must be one of: {', '.join(VALID_JOB_TYPES)}")
 
     try:
         if job_type == "masking" and dest_path is None:
@@ -146,7 +162,7 @@ def insert_job(task_id: int, track_id: int, source_path: str, dest_path: str, de
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error during job insertion: {str(e)}")
 
-def get_job(task_id: int, job_type: Optional[str] = None) -> Dict[str, Any]:
+def get_job(task_id: int, job_type: Optional[Any] = None) -> Dict[str, Any]:
     """
     Get a job by its task ID.
     
@@ -165,9 +181,9 @@ def get_job(task_id: int, job_type: Optional[str] = None) -> Dict[str, Any]:
         with get_db_connection() as conn:
             query = "SELECT * FROM jobs WHERE taskId = ?"
             params: list[Any] = [task_id]
-            if job_type:
-                query += " AND job_type = ?"
-                params.append(job_type)
+            filter_sql, filter_params = _job_type_filter_sql(job_type)
+            query += filter_sql
+            params.extend(filter_params)
 
             job = conn.execute(query, params).fetchone()
             if not job:
@@ -235,7 +251,7 @@ def update_job_status(task_id: int, status: str) -> bool:
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error during job status update: {str(e)}")
 
-def get_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
+def get_queue_stats(job_type: Optional[Any] = None) -> Dict[str, int]:
     """
     Get statistics about the job queue.
     
@@ -256,10 +272,10 @@ def get_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
             }
             
             for status in stats.keys():
+                filter_sql, filter_params = _job_type_filter_sql(job_type)
                 count = conn.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE status = ?"
-                    + (" AND job_type = ?" if job_type else ""),
-                    (status,) if not job_type else (status, job_type)
+                    "SELECT COUNT(*) FROM jobs WHERE status = ?" + filter_sql,
+                    [status] + filter_params
                 ).fetchone()[0]
                 stats[status] = count
             
@@ -267,7 +283,7 @@ def get_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error while getting queue stats: {str(e)}")
 
-def get_download_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
+def get_download_queue_stats(job_type: Optional[Any] = None) -> Dict[str, int]:
     """
     Get statistics about the job download queue.
     
@@ -287,10 +303,10 @@ def get_download_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
             }
             
             for status in stats.keys():
+                filter_sql, filter_params = _job_type_filter_sql(job_type)
                 count = conn.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE download_status = ?"
-                    + (" AND job_type = ?" if job_type else ""),
-                    (status,) if not job_type else (status, job_type)
+                    "SELECT COUNT(*) FROM jobs WHERE download_status = ?" + filter_sql,
+                    [status] + filter_params
                 ).fetchone()[0]
                 stats[status] = count
             
@@ -298,7 +314,7 @@ def get_download_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error while getting download queue stats: {str(e)}")
 
-def get_upload_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
+def get_upload_queue_stats(job_type: Optional[Any] = None) -> Dict[str, int]:
     """
     Get statistics about the job upload queue.
     
@@ -318,10 +334,10 @@ def get_upload_queue_stats(job_type: Optional[str] = None) -> Dict[str, int]:
             }
             
             for status in stats.keys():
+                filter_sql, filter_params = _job_type_filter_sql(job_type)
                 count = conn.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE upload_status = ?"
-                    + (" AND job_type = ?" if job_type else ""),
-                    (status,) if not job_type else (status, job_type)
+                    "SELECT COUNT(*) FROM jobs WHERE upload_status = ?" + filter_sql,
+                    [status] + filter_params
                 ).fetchone()[0]
                 stats[status] = count
             
@@ -388,7 +404,7 @@ def lock_job(task_id: int) -> bool:
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error during job locking: {str(e)}")
 
-def get_pending_jobs(limit: int, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_pending_jobs(limit: int, job_type: Optional[Any] = None) -> List[Dict[str, Any]]:
     """
     Get a batch of pending jobs that are ready for processing.
     Only returns jobs where download_status='completed'.
@@ -411,9 +427,9 @@ def get_pending_jobs(limit: int, job_type: Optional[str] = None) -> List[Dict[st
                 AND download_status = 'completed'
             """
             params: list[Any] = []
-            if job_type:
-                query += " AND job_type = ?"
-                params.append(job_type)
+            filter_sql, filter_params = _job_type_filter_sql(job_type)
+            query += filter_sql
+            params.extend(filter_params)
 
             query += " ORDER BY created_at ASC LIMIT ?"
             params.append(limit)
@@ -515,7 +531,7 @@ def update_upload_status(task_id: int, upload_status: str) -> bool:
     except sqlite3.Error as e:
         raise DatabaseConnectionError(f"Database error during upload status update: {str(e)}")
 
-def find_and_lock_job_for_download(job_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def find_and_lock_job_for_download(job_type: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     """
     Atomically finds the oldest job needing download and locks it.
 
@@ -541,9 +557,9 @@ def find_and_lock_job_for_download(job_type: Optional[str] = None) -> Optional[D
                 WHERE status = 'pending' AND download_status = 'pending'
             """
             params: list[Any] = []
-            if job_type:
-                base_select += " AND job_type = ?"
-                params.append(job_type)
+            filter_sql, filter_params = _job_type_filter_sql(job_type)
+            base_select += filter_sql
+            params.extend(filter_params)
 
             base_select += " ORDER BY created_at ASC LIMIT 1"
             cursor.execute(base_select, params)
@@ -585,7 +601,7 @@ def find_and_lock_job_for_download(job_type: Optional[str] = None) -> Optional[D
 def get_all_jobs(limit: int = 100, offset: int = 0, status: Optional[str] = None, 
                 download_status: Optional[str] = None, upload_status: Optional[str] = None,
                 order_by: str = "created_at", order_direction: str = "desc",
-                job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+                job_type: Optional[Any] = None) -> List[Dict[str, Any]]:
     """
     Get all jobs with pagination support.
     
@@ -623,9 +639,9 @@ def get_all_jobs(limit: int = 100, offset: int = 0, status: Optional[str] = None
                 query += " AND upload_status = ?"
                 params.append(upload_status)
             
-            if job_type is not None:
-                query += " AND job_type = ?"
-                params.append(job_type)
+            filter_sql, filter_params = _job_type_filter_sql(job_type)
+            query += filter_sql
+            params.extend(filter_params)
             
             # Add ordering
             # Basic SQL injection prevention by validating order_by against known columns
@@ -654,7 +670,7 @@ def get_all_jobs(limit: int = 100, offset: int = 0, status: Optional[str] = None
         raise DatabaseConnectionError(f"Database error while getting all jobs: {str(e)}")
 
 def reset_failed_jobs(failure_type: str = 'all', task_id: Optional[int] = None, reset_running: bool = False,
-                      job_type: Optional[str] = None) -> tuple[int, List[int]]:
+                      job_type: Optional[Any] = None) -> tuple[int, List[int]]:
     """
     Reset the status of failed jobs to 'pending' based on the specified failure type.
     Optionally also reset jobs that are stuck in the 'running' state.
@@ -686,9 +702,9 @@ def reset_failed_jobs(failure_type: str = 'all', task_id: Optional[int] = None, 
             if task_id is not None:
                 task_filter = " AND taskId = ?"
                 params.append(task_id)
-            if job_type is not None:
-                task_filter += " AND job_type = ?"
-                params.append(job_type)
+            filter_sql, filter_params = _job_type_filter_sql(job_type)
+            task_filter += filter_sql
+            params.extend(filter_params)
 
             # Download resets
             if failure_type in ('download', 'all'):
@@ -776,7 +792,7 @@ def reset_failed_jobs(failure_type: str = 'all', task_id: Optional[int] = None, 
         raise DatabaseConnectionError(f"Database error during job reset: {str(e)}")
 
 
-def list_jobs_for_cleanup(retention_days: int, statuses: List[str], job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_jobs_for_cleanup(retention_days: int, statuses: List[str], job_type: Optional[Any] = None) -> List[Dict[str, Any]]:
     """
     Return all jobs that should be deleted:
       - status IN statuses
@@ -794,9 +810,9 @@ def list_jobs_for_cleanup(retention_days: int, statuses: List[str], job_type: Op
               )
     """
     params = statuses + [cutoff]
-    if job_type is not None:
-        sql += " AND job_type = ?"
-        params.append(job_type)
+    filter_sql, filter_params = _job_type_filter_sql(job_type)
+    sql += filter_sql
+    params.extend(filter_params)
 
     with get_db_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -877,7 +893,7 @@ def get_jobs_by_ids(task_ids: List[int]) -> List[Dict[str, Any]]:
         raise DatabaseConnectionError(f"Database error while getting jobs by IDs: {str(e)}")
 
 
-def delete_jobs_by_ids(task_ids: List[int], job_type: Optional[str] = None) -> int:
+def delete_jobs_by_ids(task_ids: List[int], job_type: Optional[Any] = None) -> int:
     """
     Bulk-delete jobs by taskId.  Returns number of rows deleted.
     """
@@ -886,9 +902,9 @@ def delete_jobs_by_ids(task_ids: List[int], job_type: Optional[str] = None) -> i
     placeholders = ",".join("?" * len(task_ids))
     query = f"DELETE FROM jobs WHERE taskId IN ({placeholders})"
     params: list[Any] = list(task_ids)
-    if job_type is not None:
-        query += " AND job_type = ?"
-        params.append(job_type)
+    filter_sql, filter_params = _job_type_filter_sql(job_type)
+    query += filter_sql
+    params.extend(filter_params)
     with get_db_connection() as conn:
         cur = conn.execute(query, params)
         return cur.rowcount

@@ -39,7 +39,10 @@ load_dotenv()
 
 # --- Default Settings (can be overridden by env vars or args) ---
 DEFAULT_MODEL_PATH = os.getenv("MASKING_MODEL_ID", "/home/trbdevsysadmin/faster-whisper-th-large-v3-int8") # Default transcription model
-DEFAULT_API_URL = os.getenv("MASKING_API_URL", "http://localhost:28000/v1/audio/transcriptions") # Default transcription API
+DEFAULT_API_URL = os.getenv(
+    "MASKING_API_URL_GPU0",
+    os.getenv("MASKING_API_URL", "http://localhost:28000/v1/audio/transcriptions")
+) # Default transcription API
 DEFAULT_MAX_WORKERS = os.getenv("MASKING_MAX_WORKERS", 2) # Default parallel workers
 
 # --- JamAI Configuration ---
@@ -570,7 +573,7 @@ def main():
         transcription_logger.opt(exception=True).error(f"Error running transcription step: {e}")
         sys.exit(1)
 
-def run_transcription_step_pipeline(tasks: List[Dict]) -> Dict:
+def run_transcription_step_pipeline(tasks: List[Dict], api_url: str = DEFAULT_API_URL) -> Dict:
     """
     Pipeline-specific interface that meets 3.5.4 requirements
     
@@ -591,6 +594,7 @@ def run_transcription_step_pipeline(tasks: List[Dict]) -> Dict:
     table_id, file_results = run_transcription_step_batch(
         input_files=[t['srcPath'] for t in tasks],
         output_dirs=[t['destPath'] for t in tasks],
+        api_url=api_url,
         # Use default parameters or pass from tasks if needed
     )
     

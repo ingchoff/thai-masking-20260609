@@ -21,6 +21,8 @@ from db import (
     get_all_jobs,
     get_db_connection,
     reset_failed_jobs,
+    VALID_JOB_TYPES,
+    TRANSCRIPTION_JOB_TYPES,
     DatabaseError,
     JobInsertError,
     DatabaseConnectionError,
@@ -126,6 +128,60 @@ class RetryResponse(BaseModel):
     reset_count: int
     status: str
 
+def _job_type_count_filter(job_type: Optional[Any]) -> tuple[str, list[Any]]:
+    if job_type is None:
+        return "", []
+    if isinstance(job_type, str):
+        return " AND job_type = ?", [job_type]
+    job_types = list(job_type)
+    if not job_types:
+        return "", []
+    placeholders = ",".join("?" * len(job_types))
+    return f" AND job_type IN ({placeholders})", job_types
+
+async def _create_transcription_jobs(
+    job_requests: List[TranscriptionJobRequest],
+    job_type: str,
+    error_log_label: str
+) -> List[JobResponse]:
+    jobs = []
+
+    for job_request in job_requests:
+        task_id = job_request.taskId
+
+        for track in job_request.data:
+            if not track.destPathJson.endswith('.json'):
+                raise Exception(f"destPathJson: {track.destPathJson} must be a json file ending with '.json'.")
+
+        for track in job_request.data:
+            local_src, local_dest = generate_local_paths(str(task_id), track.sourcePath)
+
+            try:
+                insert_job(
+                    task_id=task_id,
+                    track_id=track.trackId,
+                    source_path=track.sourcePath,
+                    dest_path="None",
+                    dest_path_json=track.destPathJson,
+                    local_source_path=local_src,
+                    local_dest_dir=local_dest,
+                    job_type=job_type
+                )
+                jobs.append({
+                    "taskId": task_id,
+                    "trackId": track.trackId,
+                    "status": "success"
+                })
+            except JobInsertError as e:
+                logger.error(f"Error inserting {error_log_label} job: {str(e)}")
+                jobs.append({
+                    "taskId": task_id,
+                    "trackId": track.trackId,
+                    "status": "error"
+                })
+
+    return jobs
+
 @app.post("/v1/tasks/create", response_model=List[JobResponse])
 @handle_exceptions
 async def create_jobs(job_requests: List[JobRequest]):
@@ -187,43 +243,20 @@ async def create_transcription_jobs(job_requests: List[TranscriptionJobRequest])
     Submit new transcription-only jobs.
     Validates destPathJson and stores jobs with job_type='transcription' and destPath NULL.
     """
-    jobs = []
+    return await _create_transcription_jobs(job_requests, "transcription", "transcription")
 
-    for job_request in job_requests:
-        task_id = job_request.taskId
-
-        for track in job_request.data:
-            if not track.destPathJson.endswith('.json'):
-                raise Exception(f"destPathJson: {track.destPathJson} must be a json file ending with '.json'.")
-
-        for track in job_request.data:
-            local_src, local_dest = generate_local_paths(str(task_id), track.sourcePath)
-
-            try:
-                insert_job(
-                    task_id=task_id,
-                    track_id=track.trackId,
-                    source_path=track.sourcePath,
-                    dest_path="None",
-                    dest_path_json=track.destPathJson,
-                    local_source_path=local_src,
-                    local_dest_dir=local_dest,
-                    job_type="transcription"
-                )
-                jobs.append({
-                    "taskId": task_id,
-                    "trackId": track.trackId,
-                    "status": "success"
-                })
-            except JobInsertError as e:
-                logger.error(f"Error inserting transcription job: {str(e)}")
-                jobs.append({
-                    "taskId": task_id,
-                    "trackId": track.trackId,
-                    "status": "error"
-                })
-
-    return jobs
+@app.post("/v1/tasks/transcription/create-secondary", response_model=List[JobResponse])
+@handle_exceptions
+async def create_secondary_transcription_jobs(job_requests: List[TranscriptionJobRequest]):
+    """
+    Submit secondary transcription-only jobs.
+    Uses the same processing path as transcription jobs, routed to GPU1 by job_type.
+    """
+    return await _create_transcription_jobs(
+        job_requests,
+        "transcription_secondary",
+        "secondary transcription"
+    )
 
 @app.get("/v1/tasks/queue", response_model=QueueResponse)
 @handle_exceptions
@@ -273,7 +306,7 @@ async def get_transcription_job_status(task_id: int = Query(..., description="Th
     """
     Get status of a transcription-only job.
     """
-    job = get_job(task_id, job_type="transcription")
+    job = get_job(task_id, job_type=TRANSCRIPTION_JOB_TYPES)
 
     return {
         "taskId": job["taskId"],
@@ -303,7 +336,7 @@ async def list_jobs(
     upload_status: str = Query(None, description="Filter by upload status (pending, uploading, completed, failed)"),
     order_by: str = Query("created_at", description="Field to order by"),
     order_direction: str = Query("desc", description="Order direction (asc, desc)"),
-    job_type: str = Query(None, description="Filter by job type (masking, transcription)")
+    job_type: str = Query(None, description="Filter by job type (masking, transcription, transcription_secondary)")
 ):
     """
     List all jobs with pagination support.
@@ -356,10 +389,10 @@ async def list_jobs(
             detail=f"Invalid order_direction: {order_direction}. Must be 'asc' or 'desc'"
         )
     
-    if job_type is not None and job_type not in ['masking', 'transcription']:
+    if isinstance(job_type, str) and job_type not in VALID_JOB_TYPES:
         raise HTTPException(
             status_code=400,
-            detail="Invalid job_type. Must be 'masking' or 'transcription'"
+            detail=f"Invalid job_type. Must be one of: {', '.join(VALID_JOB_TYPES)}"
         )
     
     jobs = get_all_jobs(limit, offset, status, download_status, upload_status, order_by, order_direction, job_type)
@@ -403,9 +436,9 @@ async def list_jobs(
             count_query += " AND upload_status = ?"
             count_params.append(upload_status)
             
-        if job_type is not None:
-            count_query += " AND job_type = ?"
-            count_params.append(job_type)
+        filter_sql, filter_params = _job_type_count_filter(job_type)
+        count_query += filter_sql
+        count_params.extend(filter_params)
 
         total = conn.execute(count_query, count_params).fetchone()[0]
         conn.close()
@@ -448,7 +481,7 @@ async def list_transcription_jobs(
         upload_status=upload_status,
         order_by=order_by,
         order_direction=order_direction,
-        job_type="transcription"
+        job_type=TRANSCRIPTION_JOB_TYPES
     )
 
 @app.post("/v1/tasks/retry", response_model=RetryResponse)
@@ -486,7 +519,7 @@ async def retry_failed_transcription_jobs(retry_request: RetryRequest):
         failure_type=retry_request.failure_type,
         task_id=retry_request.task_id,
         reset_running=retry_request.reset_running,
-        job_type="transcription"
+        job_type=TRANSCRIPTION_JOB_TYPES
     )
 
     return {

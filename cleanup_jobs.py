@@ -98,7 +98,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--job-type",
-        choices=["masking", "transcription"],
+        choices=["masking", "transcription", "transcription_secondary"],
         help="Optional job type filter"
     )
 

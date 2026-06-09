@@ -18,9 +18,21 @@ utils_logger = LOGGER.bind(type="pipeline", service_name="utils")
 VLLM_API_HOST = os.getenv("VLLM_API_HOST", "http://localhost:8000")
 
 # Service Restart Configuration
-TRANSCRIPTION_SERVICE_NAME = os.getenv("TRANSCRIPTION_SERVICE_NAME", "whisper-th") # Name of the whisper docker
+TRANSCRIPTION_SERVICE_NAME_GPU0 = os.getenv(
+    "TRANSCRIPTION_SERVICE_NAME_GPU0",
+    os.getenv("TRANSCRIPTION_SERVICE_NAME", "whisper-th")
+) # Name of the GPU0 whisper docker
+TRANSCRIPTION_SERVICE_NAME_GPU1 = os.getenv(
+    "TRANSCRIPTION_SERVICE_NAME_GPU1",
+    "typhoon-th-gpu1"
+) # Name of the GPU1 whisper docker
 RESTART_DELAY_SECONDS = int(os.getenv("TRANSCRIPTION_SERVICE_RESTART_DELAY_SECONDS", 10)) # Seconds to wait after restarting
 VLLM_SERVICE_NAME = os.getenv("VLLM_SERVICE_NAME", "vllm.service") # Name of the vLLM systemd service
+
+def resolve_transcription_service_name(job_type: str = None) -> str:
+    if job_type == "transcription_secondary":
+        return TRANSCRIPTION_SERVICE_NAME_GPU1
+    return TRANSCRIPTION_SERVICE_NAME_GPU0
 
 # --- Helper Function to Run System Commands ---
 def run_system_command(command_list):
@@ -41,11 +53,12 @@ def run_system_command(command_list):
         return False
     
 
-def restart_whisper_services(restart: bool):
+def restart_whisper_services(restart: bool, job_type: str = None):
     if restart:
-        utils_logger.info(f"\nAttempting to restart transcription service: {TRANSCRIPTION_SERVICE_NAME}")
-#        restart_command = ["sudo", "systemctl", "restart", TRANSCRIPTION_SERVICE_NAME]
-        restart_command = ["docker", "restart", TRANSCRIPTION_SERVICE_NAME]
+        service_name = resolve_transcription_service_name(job_type)
+        utils_logger.info(f"\nAttempting to restart transcription service: {service_name}")
+#        restart_command = ["sudo", "systemctl", "restart", service_name]
+        restart_command = ["docker", "restart", service_name]
         if not run_system_command(restart_command):
             utils_logger.error("Service restart failed. Exiting pipeline.")
             # sys.exit(1) # Stop if restart fails

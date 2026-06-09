@@ -58,7 +58,7 @@ def run_masking_pipeline_batch(tasks: List[Dict]) -> List[Dict]:
         pipeline_logger.info(f"Starting masking pipeline for {len(tasks)} tasks")
 
         # Step 1: Transcription
-        restart_whisper_services(True)
+        restart_whisper_services(True, job_type="masking")
         stop_vllm_services(VLLM_USE_SLEEP)
         step1_result = run_transcription_step_pipeline(tasks)
         tasks = step1_result['tasks']
@@ -66,7 +66,7 @@ def run_masking_pipeline_batch(tasks: List[Dict]) -> List[Dict]:
             pipeline_logger.warning(f"Transcription step had {step1_result['stats']['failed']} failures")
 
         # Step 2: Add Masking Column
-        restart_whisper_services(True)
+        restart_whisper_services(True, job_type="masking")
         start_vllm_services(VLLM_USE_SLEEP)
         step2_result = run_add_masking_column_pipeline(
             table_id=step1_result['table_id'], # step 1 table
@@ -191,7 +191,7 @@ def run_masking_pipeline_batch(tasks: List[Dict]) -> List[Dict]:
         return _format_failed_tasks(tasks, f"pipeline_error: {str(e)}")
 
 
-def run_transcription_only_batch(tasks: List[Dict]) -> Dict:
+def run_transcription_only_batch(tasks: List[Dict], api_url: str = None, job_type: str = "transcription") -> Dict:
     """
     Run only the transcription step for a batch of tasks.
     """
@@ -204,9 +204,12 @@ def run_transcription_only_batch(tasks: List[Dict]) -> Dict:
 
         pipeline_logger.info(f"Starting transcription-only pipeline for {len(tasks)} tasks")
 
-        restart_whisper_services(True)
+        restart_whisper_services(True, job_type=job_type)
         stop_vllm_services(VLLM_USE_SLEEP)
-        step1_result = run_transcription_step_pipeline(tasks)
+        if api_url:
+            step1_result = run_transcription_step_pipeline(tasks, api_url=api_url)
+        else:
+            step1_result = run_transcription_step_pipeline(tasks)
         tasks = step1_result['tasks']
 
         return {

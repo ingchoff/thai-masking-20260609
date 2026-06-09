@@ -93,9 +93,9 @@ upgrade your existing database.
    copies the database; if you see a message that the checkpoint failed, make
    sure all services that might be writing to `db/jobs.db` are stopped and run
    the script again so the WAL contents are flushed.
-3. Execute the latest migration (adds job_type and allows destPath to be NULL):
+3. Execute the latest migration (allows secondary transcription jobs):
    ```bash
-   uv run python migrate_db_20251115.py --source db/jobs.db --target db/jobs_migrated.db --backup db/jobs_backup.db --verify --replace
+   uv run python migrate_db_20260609.py --source db/jobs.db --target db/jobs_migrated.db --backup db/jobs_backup_20260609.db --verify --replace
    ```
    - `--backup` writes a backup before migrating.
    - `--verify` checks row counts after migration.
@@ -179,7 +179,7 @@ Each track will be processed as a separate job and to be download with a separat
 ```
 
 ### POST /v1/tasks/transcription/create
-Submit transcription-only jobs (runs only transcription; uploads JSON).
+Submit transcription-only jobs on GPU0 (runs only transcription; uploads JSON).
 
 **Request Body (Example):**
 ```json
@@ -198,6 +198,9 @@ Submit transcription-only jobs (runs only transcription; uploads JSON).
 ```
 
 Response shape matches `/v1/tasks/create` (taskId/trackId/status).
+
+### POST /v1/tasks/transcription/create-secondary
+Submit transcription-only jobs on GPU1. Request and response shape match `/v1/tasks/transcription/create`.
 
 ### GET /v1/tasks/queue
 Get statistics about the job queue.
@@ -274,7 +277,7 @@ List jobs with pagination and filters.
   - `status`: `pending|running|completed|completed_no_card|failed`
   - `download_status`: `pending|downloading|completed|failed`
   - `upload_status`: `pending|uploading|completed|failed`
-  - `job_type`: `masking|transcription`
+  - `job_type`: `masking|transcription|transcription_secondary`
 - Sorting:
   - `order_by`: any DB column exposed by the API (e.g., `created_at`, `destPathJson`, `job_type`, `taskId`, `trackId`)
   - `order_direction`: `asc|desc`
@@ -328,10 +331,10 @@ List jobs with pagination and filters.
 ```
 
 ### GET /v1/tasks/transcription/list
-List transcription-only jobs (same params as /v1/tasks/list, job_type fixed to transcription).
+List transcription-only jobs (same params as /v1/tasks/list, includes both transcription job types).
 
 **Query Parameters:**
-- Same as `/v1/tasks/list`, but `job_type` is implicitly `transcription`.
+- Same as `/v1/tasks/list`, but `job_type` is implicitly `transcription` and `transcription_secondary`.
 
 **Example:** `?limit=1&page=1`
 
@@ -383,7 +386,7 @@ Reset failed jobs (filters by failure_type and optional task_id).
 ```
 
 ### POST /v1/tasks/transcription/retry
-Reset failed transcription jobs only.
+Reset failed transcription jobs only, including secondary transcription jobs.
 
 **Request/Response:** Same shape as `/v1/tasks/retry`; affects only transcription jobs.
 

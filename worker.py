@@ -9,6 +9,7 @@ import time
 import signal
 import threading
 import traceback
+import concurrent.futures
 from Masking.logging_utils import LOGGER
 from typing import Dict, Any, List
 from dotenv import load_dotenv
@@ -41,6 +42,14 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '5'))  # seconds
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '10'))
 MIN_PENDING_JOBS = int(os.getenv('MIN_PENDING_JOBS', '10'))
 MIN_PROCESS_INTERVAL = int(os.getenv('MIN_PROCESS_INTERVAL', '60'))  # seconds (1 minute)
+MASKING_API_URL_GPU0 = os.getenv(
+    'MASKING_API_URL_GPU0',
+    os.getenv('MASKING_API_URL', 'http://localhost:28000/v1/audio/transcriptions')
+)
+MASKING_API_URL_GPU1 = os.getenv(
+    'MASKING_API_URL_GPU1',
+    'http://localhost:28002/v1/audio/transcriptions'
+)
 
 # Add a global flag for shutdown
 shutdown_requested = False
@@ -63,6 +72,48 @@ class TransientError(Exception):
 class PermanentError(Exception):
     """Error that cannot be resolved by retrying the operation."""
     pass
+
+def finalize_batch_results(locked_jobs: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> None:
+    for result in results:
+        task_id = next((job['taskId'] for job in locked_jobs
+                      if job['taskId'] == result.get('taskId') and
+                         job['trackId'] == result.get('trackId')), None)
+
+        if task_id:
+            status = result.get('final_status') or result.get('status', 'failed')
+            if status == 'success':
+                status = 'completed'
+
+            valid_statuses = {'pending', 'running', 'completed', 'completed_no_card', 'failed'}
+            if status not in valid_statuses:
+                status = 'failed'
+
+            update_job_status(task_id, status)
+
+def lock_pending_batch(job_type: str) -> List[Dict[str, Any]]:
+    jobs = get_pending_jobs(BATCH_SIZE, job_type=job_type)
+    if not jobs:
+        return []
+
+    logger.info(f"Processing batch of {len(jobs)} {job_type} jobs")
+
+    locked_jobs = []
+    for job in jobs:
+        if lock_job(job['taskId']):
+            locked_jobs.append(job)
+        else:
+            logger.warning(f"Failed to lock job {job['taskId']}, skipping")
+
+    return locked_jobs
+
+def process_job_type_batch(job_type: str) -> int:
+    locked_jobs = lock_pending_batch(job_type)
+    if not locked_jobs:
+        return 0
+
+    results = process_batch_jobs(locked_jobs, job_type=job_type)
+    finalize_batch_results(locked_jobs, results)
+    return len(locked_jobs)
 
 def process_batch(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -131,9 +182,11 @@ def process_batch_jobs(jobs: List[Dict[str, Any]], job_type: str = "masking") ->
         ]
         
         # Call the appropriate batch processing function
-        if job_type == "transcription":
+        if job_type in ("transcription", "transcription_secondary"):
             from pipeline import run_transcription_only_batch
-            results = run_transcription_only_batch(tasks).get("tasks")
+            api_url = MASKING_API_URL_GPU1 if job_type == "transcription_secondary" else MASKING_API_URL_GPU0
+            logger.info(f"Routing {job_type} batch to transcription API: {api_url}")
+            results = run_transcription_only_batch(tasks, api_url=api_url, job_type=job_type).get("tasks")
         else:
             results = process_batch(tasks)
         
@@ -233,9 +286,11 @@ def main():
             # Get queue stats to check pending job count
             stats_all = get_queue_stats()
             stats_transcription = get_queue_stats(job_type="transcription")
+            stats_transcription_secondary = get_queue_stats(job_type="transcription_secondary")
             pending_count = stats_all['pending']
             running_count = stats_all['running']
             transcription_pending = stats_transcription['pending']
+            transcription_secondary_pending = stats_transcription_secondary['pending']
             
             # Process jobs if:
             # 1. At least MIN_PROCESS_INTERVAL seconds have passed since the last processing, or
@@ -243,7 +298,8 @@ def main():
             # 3. No running jobs
             if (time_since_last_process >= MIN_PROCESS_INTERVAL or 
                 pending_count >= MIN_PENDING_JOBS or
-                transcription_pending > 0):
+                transcription_pending > 0 or
+                transcription_secondary_pending > 0):
                 if running_count > 0:
                     time.sleep(POLL_INTERVAL)
                     continue
@@ -252,47 +308,33 @@ def main():
                     if shutdown_requested:
                         logger.info("Shutdown requested quitting worker process...")
                         break
-                # Get a batch of pending jobs
-                # Prioritize transcription jobs if any pending, else masking
-                job_type_to_process = "transcription" if transcription_pending > 0 else "masking"
-                jobs = get_pending_jobs(BATCH_SIZE, job_type=job_type_to_process)
-                
-                if jobs:
-                    logger.info(f"Processing batch of {len(jobs)} jobs")
-                    
-                    # Lock all jobs in the batch
-                    locked_jobs = []
-                    for job in jobs:
-                        if lock_job(job['taskId']):
-                            locked_jobs.append(job)
-                        else:
-                            logger.warning(f"Failed to lock job {job['taskId']}, skipping")
-                    
-                    if locked_jobs:
-                        # Process the batch
-                        results = process_batch_jobs(locked_jobs, job_type=job_type_to_process)
-                        
-                        # Update job statuses based on results
-                        for result in results:
-                            task_id = next((job['taskId'] for job in locked_jobs
-                                          if job['taskId'] == result['taskId'] and
-                                             job['trackId'] == result['trackId']), None)
+                transcription_job_types = []
+                if transcription_pending > 0:
+                    transcription_job_types.append("transcription")
+                if transcription_secondary_pending > 0:
+                    transcription_job_types.append("transcription_secondary")
 
-                            if task_id:
-                                status = result.get('final_status') or result.get('status', 'failed')
-                                if status == 'success':
-                                    status = 'completed'
-
-                                valid_statuses = {'pending', 'running', 'completed', 'completed_no_card', 'failed'}
-                                if status not in valid_statuses:
-                                    status = 'failed'
-
-                                update_job_status(task_id, status)
-                    # Update last process time
+                if transcription_job_types:
+                    logger.info(f"Processing transcription queues in parallel: {transcription_job_types}")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(transcription_job_types)) as executor:
+                        futures = {
+                            executor.submit(process_job_type_batch, job_type): job_type
+                            for job_type in transcription_job_types
+                        }
+                        for future in concurrent.futures.as_completed(futures):
+                            job_type = futures[future]
+                            try:
+                                processed_count = future.result()
+                                logger.info(f"Finished {job_type} batch with {processed_count} locked jobs")
+                            except Exception as e:
+                                logger.error(f"Parallel {job_type} batch failed: {str(e)}\n{traceback.format_exc()}")
                     last_process_time = time.time()
                 else:
-                    # No pending jobs, wait before checking again
-                    time.sleep(POLL_INTERVAL)
+                    processed_count = process_job_type_batch("masking")
+                    if processed_count:
+                        last_process_time = time.time()
+                    else:
+                        time.sleep(POLL_INTERVAL)
             else:
                 # Not time to process yet, wait before checking again
                 time.sleep(POLL_INTERVAL)
