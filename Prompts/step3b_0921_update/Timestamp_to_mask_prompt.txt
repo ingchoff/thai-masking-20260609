@@ -1,0 +1,29 @@
+### ✅ **Intelligent Formatter**
+
+# 🎯 **Your Job: To properly transform input into output**
+
+---
+
+## 🧩 **Output Specification**
+
+For **each** JSON object in the <Conclusion> transform into the output:
+
+## 📤 **Output Format (STRICT)**
+
+* Output **only** the list of transformed JSON arrays.
+* **No explanations, no text, no comments.**
+* **STOP** after the closing `</Machine_Readable_Output>`.
+
+> ✅ **Example:**
+> <Machine_Readable_Output>
+> [
+> {"start": 200.01, "end": 205.33}
+> ]
+> </Machine_Readable_Output>
+
+
+---
+**No explanations, no text before or after. STOP after the last line.**
+
+## Input:
+${Combined}

@@ -1,0 +1,247 @@
+"""
+sftp_utils.py  –  robust client-side SFTP helper
+------------------------------------------------
+All public functions (download_from_sftp, upload_file_to_sftp, debug_sftp_connection)
+behave exactly as before, but internally they are protected against
+“Error reading SSH protocol banner” / “Connection reset by peer”.
+"""
+
+import os
+import socket
+import time
+import logging
+import contextlib
+from datetime import datetime
+from typing import Tuple
+
+import paramiko
+from paramiko.ssh_exception import SSHException, AuthenticationException
+from dotenv import load_dotenv
+from notification_utils import send_notification
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+load_dotenv()
+
+# ------------------------------------------------------------------
+# Utility helpers (unchanged)
+# ------------------------------------------------------------------
+def sanitize_filename(filename: str) -> str:
+    keep_chars = (' ', '.', '_', '-')
+    return "".join(c for c in filename if c.isalnum() or c in keep_chars).rstrip()
+
+
+def generate_local_paths(task_id: str, source_path: str) -> Tuple[str, str]:
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    base_dir = os.getenv('LOCAL_STORAGE_BASE', '/tmp/thai-masking')
+
+    filename = sanitize_filename(os.path.basename(source_path))
+    local_src = os.path.join(base_dir, date_str, 'ORG', f"{task_id}_{filename}")
+    local_dest = os.path.join(base_dir, date_str, 'MASK', task_id)
+
+    return local_src, local_dest
+
+
+# ------------------------------------------------------------------
+# Internal SFTP session factory
+# ------------------------------------------------------------------
+@contextlib.contextmanager
+def _robust_sftp_session(host: str, port: int, user: str, password: str):
+    """
+    Context manager that yields an SFTPClient and guarantees
+    the underlying transport and SSHClient are closed.
+    Retries on banner/reset errors with exponential back-off.
+    """
+    MAX_RETRIES = 3
+    INITIAL_BACKOFF = 1
+
+    ssh_client = None
+    sftp_client = None
+    retry = 0
+
+    while True:
+        try:
+            ssh_client = paramiko.SSHClient()
+            ssh_client.load_system_host_keys()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            ssh_client.connect(
+                hostname=host,
+                port=port,
+                username=user,
+                password=password,
+                timeout=30,              # TCP connect timeout
+                banner_timeout=60,       # Time to wait for the banner
+                auth_timeout=60,         # Time to wait for auth
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            sftp_client = ssh_client.open_sftp()
+            break  # success
+
+        except (SSHException, socket.error) as exc:
+            # Only retry for banner/reset issues
+            if (
+                "Error reading SSH protocol banner" in str(exc)
+                or "Connection reset by peer" in str(exc)
+            ):
+                retry += 1
+                if retry > MAX_RETRIES:
+                    logger.error("Max retries reached for banner/reset error")
+                    raise
+                sleep_for = INITIAL_BACKOFF * (2 ** (retry - 1))
+                logger.warning("Banner/reset error, retrying in %ss … (%s)", sleep_for, exc)
+                time.sleep(sleep_for)
+                continue
+            else:
+                raise  # fatal SSH/Auth error
+        except Exception:
+            raise  # any other exception -> fatal
+
+    try:
+        yield sftp_client
+    finally:
+        # Ensure everything is closed in reverse order
+        try:
+            if sftp_client:
+                sftp_client.close()
+        except Exception:
+            pass
+        try:
+            if ssh_client:
+                ssh_client.close()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------
+# Public API – unchanged signatures
+# ------------------------------------------------------------------
+def debug_sftp_connection():
+    host = os.getenv('SOURCE_SFTP_HOST')
+    port = int(os.getenv('SOURCE_SFTP_PORT'))
+    user = os.getenv('SOURCE_SFTP_USER')
+    password = os.getenv('SOURCE_SFTP_PASS')
+
+    try:
+        with _robust_sftp_session(host, port, user, password) as sftp:
+            pwd = sftp.getcwd()
+            logger.info("Current remote directory: %s", pwd)
+
+            logger.info("Contents of current directory:")
+            for filename in sftp.listdir('.'):
+                logger.info(" - %s", filename)
+
+            try:
+                logger.info("\nContents of root directory (/):")
+                for filename in sftp.listdir('/'):
+                    logger.info(" - %s", filename)
+            except Exception as e:
+                logger.warning("Couldn't list root directory: %s", e)
+
+    except Exception as e:
+        logger.error("Debug connection failed: %s", e)
+
+
+def download_from_sftp(remote_path: str, local_path: str) -> tuple[bool, str]:
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    temp_path = f"{local_path}.tmp"
+
+    try:
+        host = os.getenv('SOURCE_SFTP_HOST')
+        port = int(os.getenv('SOURCE_SFTP_PORT'))
+        user = os.getenv('SOURCE_SFTP_USER')
+        password = os.getenv('SOURCE_SFTP_PASS')
+        error_msg = ""
+
+        with _robust_sftp_session(host, port, user, password) as sftp:
+            sftp.get(remote_path, temp_path)
+            os.rename(temp_path, local_path)
+            logger.info("Successfully downloaded %s to %s", remote_path, local_path)
+            return True, error_msg
+
+    except (SSHException, AuthenticationException) as e:
+        error_msg = f"SSH/Auth error downloading f{remote_path}: {str(e)}"
+        logger.error(error_msg)
+    except IOError as e:
+        error_msg = f"File I/O error downloading {remote_path}: {str(e)}"
+        logger.error(error_msg)
+    except Exception as e:
+        error_msg = f"Unexpected error downloading {remote_path}: {str(e)}"
+        logger.error(error_msg)
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+    return False, error_msg or "Failed to download file"
+
+
+# ------------------------------------------------------------------
+# Upload helpers (mkdir_p + upload_file_to_sftp)
+# ------------------------------------------------------------------
+def _mkdir_p(sftp: paramiko.SFTPClient, remote_directory: str):
+    if remote_directory in ('/', ''):
+        return
+    try:
+        sftp.chdir(remote_directory)
+    except IOError:
+        dirname, basename = os.path.split(remote_directory.rstrip('/'))
+        _mkdir_p(sftp, dirname)
+        sftp.mkdir(basename)
+        sftp.chdir(basename)
+
+
+def upload_file_to_sftp(local_path: str, remote_path: str) -> bool:
+    if not os.path.isfile(local_path):
+        logger.error("Local file %s does not exist or is not a file", local_path)
+        return False
+
+    try:
+        host = os.getenv('DEST_SFTP_HOST')
+        port = int(os.getenv('DEST_SFTP_PORT'))
+        user = os.getenv('DEST_SFTP_USER')
+        password = os.getenv('DEST_SFTP_PASS')
+
+        with _robust_sftp_session(host, port, user, password) as sftp:
+            is_directory = False
+            if remote_path.endswith('/'):
+                is_directory = True
+            else:
+                try:
+                    sftp.listdir(remote_path)
+                    is_directory = True
+                except IOError:
+                    is_directory = False
+
+            if is_directory:
+                if not remote_path.endswith('/'):
+                    remote_path += '/'
+                full_remote_path = remote_path + os.path.basename(local_path)
+            else:
+                full_remote_path = remote_path
+
+            remote_dir = os.path.dirname(full_remote_path)
+            if remote_dir:
+                _mkdir_p(sftp, remote_dir)
+
+            try:
+                sftp.stat(full_remote_path)
+                logger.warning("File %s already exists, removing…", full_remote_path)
+                sftp.remove(full_remote_path)
+            except IOError:
+                pass
+
+            logger.info("Uploading %s to %s", local_path, full_remote_path)
+            sftp.put(local_path, full_remote_path)
+            logger.info("Successfully uploaded %s to %s", local_path, full_remote_path)
+            return True
+
+    except (SSHException, AuthenticationException) as e:
+        logger.error("SSH/Auth error uploading to %s: %s", remote_path, e)
+    except Exception as e:
+        logger.error("Failed to upload to %s: %s", remote_path, e)
+    return False

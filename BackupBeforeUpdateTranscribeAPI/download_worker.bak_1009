@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+Background worker for downloading source files via SFTP.
+This script polls the database for jobs with a 'pending' download status,
+downloads the associated files, and updates their status accordingly.
+It self-throttles to avoid overwhelming the SFTP server.
+"""
+import os
+import time
+import sys
+import signal
+import traceback
+from dotenv import load_dotenv
+from Masking.logging_utils import LOGGER
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize logger from logging_utils
+logger = LOGGER.bind(name="download-worker", service_name="download-worker")
+
+# Import database and SFTP utility functions
+try:
+    from db import (
+        init_db,
+        update_job_status,
+        update_download_status,
+        find_and_lock_job_for_download,
+    )
+    from sftp_utils import download_from_sftp, debug_sftp_connection
+except ImportError:
+    logger.error("Could not import db.py or sftp_utils.py. Ensure they are in the same directory or Python path.")
+    sys.exit(1)
+
+# --- Worker Configuration ---
+POLL_INTERVAL = int(os.getenv('DOWNLOAD_POLL_INTERVAL', '5'))
+
+# Graceful shutdown handling
+shutdown_requested = False
+
+def handle_signal(signum, frame):
+    """Handle shutdown signals"""
+    global shutdown_requested
+    shutdown_requested = True
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, handle_signal)  # systemd stop/restart
+signal.signal(signal.SIGINT, handle_signal)   # Ctrl+C
+
+def download_and_update_status(task_id: int, track_id: int, remote_path: str, local_path: str):
+    """Function to handle SFTP download and status updates"""
+    debug_sftp_connection()
+    try:
+        if download_from_sftp(remote_path, local_path):
+            logger.info(f"Successfully downloaded {remote_path} for task {task_id}")
+            update_download_status(task_id, "completed")
+        else:
+            logger.error(f"Failed to download {remote_path} for task {task_id}")
+            update_job_status(task_id, "failed")
+            update_download_status(task_id, "failed")
+    except Exception as e:
+        logger.error(f"Error downloading {remote_path}: {str(e)}")
+        update_job_status(task_id, "failed")
+        update_download_status(task_id, "failed")
+
+def main():
+    """
+    Main worker loop.
+    Polls the database for jobs needing download and processes them,
+    respecting the concurrency limit.
+    """
+    logger.info("Starting SFTP download worker...")
+    logger.info(f"Polling interval set to: {POLL_INTERVAL} seconds")
+    init_db()
+    
+    while not shutdown_requested:
+        try:
+            job_to_process = find_and_lock_job_for_download()
+            if job_to_process:
+                logger.info(f"Found pending job to download: Task ID {job_to_process['taskId']}")
+                download_and_update_status(
+                    job_to_process['taskId'],
+                    job_to_process['trackId'],
+                    job_to_process['sourcePath'],
+                    job_to_process['local_source_path']
+                )
+            else:
+                # No jobs found - wait with periodic shutdown checks
+                logger.debug("No pending downloads found. Waiting.")
+                for _ in range(POLL_INTERVAL):
+                    if shutdown_requested:
+                        break
+                    time.sleep(1)
+                    
+        except Exception as e:
+            logger.critical(f"FATAL: An unexpected error occurred: {str(e)}\n{traceback.format_exc()}")
+            # Wait longer but still check for shutdown periodically
+            for _ in range(POLL_INTERVAL * 2):
+                if shutdown_requested:
+                    break
+                time.sleep(1)
+    
+    logger.info("Download worker shutting down gracefully.")
+
+if __name__ == "__main__":
+    main()

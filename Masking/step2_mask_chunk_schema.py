@@ -1,0 +1,436 @@
+"""Step 2 of masking pipeline: Chunk segments from input table into output table."""
+import os
+import re
+import json
+import sys
+import argparse
+import traceback
+from datetime import datetime
+from typing import Optional, Tuple, List, Dict, Any
+from dotenv import load_dotenv
+import tiktoken
+from jamaibase import JamAI, protocol as p
+from jamaibase.utils.exceptions import ResourceNotFoundError, JamaiException
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+try:
+    from Masking.jamai_utils import normalize_row_values, resolve_jamai_timeout
+except ImportError:
+    from jamai_utils import normalize_row_values, resolve_jamai_timeout
+
+# Initialize pipeline logger
+pipeline_logger = LOGGER.bind(type="pipeline", service_name="mask_chunk")
+
+# --- Configuration ---
+load_dotenv()
+
+# Constants
+PROJECT_ID = os.getenv("PROJECT_ID", "proj_f7d3c85dddfa84363ab29f4b")
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+JAMAI_TIMEOUT_SEC = resolve_jamai_timeout(logger=pipeline_logger)
+TABLE_TYPE = p.TableType.ACTION
+INPUT_TABLE_PREFIX = "step1_"
+OUTPUT_SCHEMA_TABLE_ID = "step2"
+OUTPUT_TABLE_PREFIX = "step2_"
+DEFAULT_CONTEXT_LIMIT = int(os.getenv("MODEL_CONTEXT_LIMIT", "32000"))
+DEFAULT_FETCH_LIMIT = 100
+
+def parse_timestamp_from_id(table_id: str, prefix: str) -> Optional[str]:
+    """Extracts YYYYMMDD_HHMMSS from table ID if it matches prefix.
+    
+    Args:
+        table_id: Full table ID to parse
+        prefix: Expected prefix before timestamp
+        
+    Returns:
+        Extracted timestamp string or None if invalid
+    """
+    if table_id.startswith(prefix):
+        timestamp_part = table_id[len(prefix):]
+        try:
+            datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
+            return timestamp_part
+        except ValueError:
+            return None
+    return None
+
+def count_tokens(text: Optional[str], tokenizer: Any) -> int:
+    """Counts tokens using the provided tiktoken tokenizer.
+    
+    Args:
+        text: Text to tokenize
+        tokenizer: Initialized tiktoken tokenizer
+        
+    Returns:
+        Number of tokens
+    """
+    if not text:
+        return 0
+    try:
+        return len(tokenizer.encode(text))
+    except Exception:
+        return len(text) // 4  # Fallback estimation
+
+def extract_payment_card_info(text: Optional[str]) -> str:
+    """Extracts text between payment card info tags.
+    
+    Args:
+        text: Text containing potential payment card info
+        
+    Returns:
+        Extracted payment card info or empty string
+    """
+    if not text:
+        return ""
+    pattern = r'<CONTAINS PAYMENT CARD INFO>(.*?)</CONTAINS PAYMENT CARD INFO>'
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+def split_segments_into_chunks(
+    segments_json: str, 
+    token_limit: int, 
+    tokenizer: Any,
+    safety_factor: float = 0.9
+) -> List[str]:
+    """Splits segments into chunks under token limit.
+    
+    Args:
+        segments_json: JSON string of segments to chunk
+        token_limit: Max tokens per chunk
+        tokenizer: Initialized tiktoken tokenizer
+        safety_factor: Multiplier for conservative chunking
+        
+    Returns:
+        List of chunked segment JSON strings
+    """
+    effective_limit = int(token_limit * safety_factor)
+    try:
+        segments = json.loads(segments_json)
+        if not isinstance(segments, list):
+            return [segments_json]
+
+        filtered_segments = []
+        for segment in segments:
+            if isinstance(segment, dict):
+                filtered_segments.append(segment)
+
+        if not filtered_segments:
+            return []
+
+        # Count tokens only from "text" keys
+        total_text_tokens = 0
+        for segment in filtered_segments:
+            text = segment.get("text", "")
+            total_text_tokens += count_tokens(text, tokenizer)
+        
+        n = max(1, (total_text_tokens + effective_limit - 1) // effective_limit)
+
+        if n == 1 and total_text_tokens <= token_limit:
+            return [json.dumps(filtered_segments, ensure_ascii=False)]
+        elif n == 1 and total_text_tokens > token_limit:
+            return [json.dumps(filtered_segments, ensure_ascii=False)]
+
+        total_segments = len(filtered_segments)
+        chunk_size = max(1, (total_segments + n - 1) // n)
+        chunks = []
+
+        for i in range(0, total_segments, chunk_size):
+            chunk_segments = filtered_segments[i:min(i + chunk_size, total_segments)]
+            if chunk_segments:
+                chunks.append(json.dumps(chunk_segments, ensure_ascii=False))
+
+        return chunks
+
+    except json.JSONDecodeError:
+        return [segments_json]
+    except Exception:
+        return [segments_json]
+
+def setup_output_table(
+    jamai: JamAI,
+    input_table_timestamp: str,
+    output_schema_table_id: str = OUTPUT_SCHEMA_TABLE_ID
+) -> str:
+    """Sets up the output table by duplicating schema.
+    
+    Args:
+        jamai: Initialized JamAI client
+        input_table_timestamp: Timestamp string for output table naming
+        output_schema_table_id: Schema template table ID
+        
+    Returns:
+        ID of the created output table
+        
+    Raises:
+        JamaiException: If table operations fail
+    """
+    output_table_id = f"{OUTPUT_TABLE_PREFIX}{input_table_timestamp}"
+    
+    # Check if output schema exists
+    jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_schema_table_id)
+    
+    # Delete existing output table if present
+    try:
+        jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_table_id)
+        jamai.table.delete_table(table_type=TABLE_TYPE, table_id=output_table_id)
+    except ResourceNotFoundError:
+        pass
+    
+    # Duplicate schema to new table
+    jamai.table.duplicate_table(
+        table_type=TABLE_TYPE,
+        table_id_src=output_schema_table_id,
+        table_id_dst=output_table_id,
+        include_data=False
+    )
+    
+    return output_table_id
+
+def process_input_table_page(
+    jamai: JamAI,
+    input_table_id: str,
+    output_table_id: str,
+    tokenizer: Any,
+    token_limit: int,
+    offset: int,
+    limit: int
+) -> dict:
+    """Processes one page of rows from input table.
+    
+    Args:
+        jamai: Initialized JamAI client
+        input_table_id: ID of input table
+        output_table_id: ID of output table
+        tokenizer: Initialized tiktoken tokenizer
+        token_limit: Max tokens per chunk
+        offset: Pagination offset
+        limit: Rows per page
+        
+    Returns:
+        {
+            "processed": Number of rows processed
+            "hits": Number of rows with payment card info
+        }
+    """
+    rows = jamai.table.list_table_rows(
+        table_type=TABLE_TYPE,
+        table_id=input_table_id,
+        columns=["file_path", "Transcription", "SegmentsAndWords", "Masking_need"],
+        limit=limit,
+        offset=offset
+    )
+
+    rows_with_card_info = []
+    for row in rows.items:
+        row = normalize_row_values(row)
+        row_id = row.get("ID")
+        if not row_id:
+            continue
+
+        masking_need = str(row.get("Masking_need") or "")
+        if "yes" in extract_payment_card_info(masking_need).lower():
+            rows_with_card_info.append(row)
+
+    for row_data in rows_with_card_info:
+        row_id = row_data.get("ID")
+        segments_json = str(row_data.get("SegmentsAndWords") or "")
+        
+        chunks = split_segments_into_chunks(segments_json, token_limit, tokenizer)
+        
+        for i, chunk_data in enumerate(chunks, 1):
+            insert_payload = {
+                "row_id_Input_table": row_id,
+                "file_path": row_data.get("file_path") or "",
+                "Transcription": row_data.get("Transcription") or "",
+                "Explain": row_data.get("Masking_need") or "",
+                "chunk_count": i,
+                "total_chunks": len(chunks),
+                "SegmentsAndWords": chunk_data
+            }
+
+            jamai.table.add_table_rows(
+                table_type=TABLE_TYPE,
+                request=p.RowAddRequest(
+                    table_id=output_table_id,
+                    data=[insert_payload],
+                    stream=False,
+                )
+            )
+
+    return {
+        "processed": len(rows.items), "hits": len(rows_with_card_info)
+    }
+
+def run_mask_chunk_step_pipeline(
+    input_table_id: Optional[str] = None,
+    context_limit: int = DEFAULT_CONTEXT_LIMIT,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None
+) -> Dict[str, Any]:
+    """Pipeline version of mask chunk step that returns structured results.
+    
+    Args:
+        input_table_id: Explicit table ID or None to auto-detect latest
+        context_limit: Token limit for each segment chunk
+        row_limit: Max rows to process from input table
+        jamai_client: Optional pre-configured JamAI client
+        
+    Returns:
+        Dictionary with:
+        - table_id: ID of created output table
+        - stats: Processing statistics
+    """
+    try:
+        output_table_id = run_mask_chunk_step(
+            input_table_id=input_table_id,
+            context_limit=context_limit,
+            row_limit=row_limit,
+            jamai_client=jamai_client
+        )
+        return {
+            "table_id": output_table_id,
+            "stats": {
+                "status": "completed",
+                "message": "Successfully processed masking chunks"
+            }
+        }
+    except Exception as e:
+        return {
+            "table_id": None,
+            "stats": {
+                "status": "failed",
+                "message": str(e)
+            }
+        }
+
+def run_mask_chunk_step(
+    input_table_id: Optional[str] = None,
+    context_limit: int = DEFAULT_CONTEXT_LIMIT,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None
+) -> str:
+    """Main function to process input table and create chunked output table.
+    
+    Args:
+        input_table_id: Explicit table ID or None to auto-detect latest
+        context_limit: Token limit for each segment chunk
+        row_limit: Max rows to process from input table
+        jamai_client: Optional pre-configured JamAI client
+        
+    Returns:
+        ID of the created output table
+        
+    Raises:
+        JamaiException: For JamAI-specific errors
+        ValueError: For invalid inputs
+    """
+    jamai = jamai_client or JamAI(
+        project_id=PROJECT_ID,
+        api_base=JAMAI_API_BASE,
+        timeout=JAMAI_TIMEOUT_SEC,
+    )
+    
+    # Initialize tokenizer
+    tokenizer = tiktoken.get_encoding("o200k_base")
+    
+    # Determine input table
+    if input_table_id:
+        input_table_timestamp = parse_timestamp_from_id(input_table_id, INPUT_TABLE_PREFIX)
+        if not input_table_timestamp:
+            input_table_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        tables = jamai.table.list_tables(table_type=TABLE_TYPE)
+        found_tables = []
+        for item in tables.items:
+            timestamp = parse_timestamp_from_id(item.id, INPUT_TABLE_PREFIX)
+            if timestamp:
+                found_tables.append((datetime.strptime(timestamp, "%Y%m%d_%H%M%S"), item.id, timestamp))
+        
+        if not found_tables:
+            pipeline_logger.error(f"No tables found matching prefix '{INPUT_TABLE_PREFIX}'")
+            raise ValueError(f"No tables found matching prefix '{INPUT_TABLE_PREFIX}'")
+        
+        found_tables.sort(key=lambda x: x[0], reverse=True)
+        _, input_table_id, input_table_timestamp = found_tables[0]
+    
+    # Setup output table
+    pipeline_logger.info(f"Setting up output table for input: {input_table_id}")
+    output_table_id = setup_output_table(jamai, input_table_timestamp)
+    pipeline_logger.info(f"Created output table: {output_table_id}")
+    
+    # Process table pages
+    processed = 0
+    hits = 0
+    page_num = 1
+    total_rows = float('inf')
+    
+    if row_limit is None:
+        try:
+            table_info = jamai.table.get_table(table_type=TABLE_TYPE, table_id=input_table_id)
+            total_rows = table_info.num_rows
+        except Exception:
+            pass
+    
+    while processed < min(total_rows, row_limit or float('inf')):
+        limit = DEFAULT_FETCH_LIMIT
+        if row_limit:
+            limit = min(limit, row_limit - processed)
+        
+        try:
+            ret = process_input_table_page(
+                jamai=jamai,
+                input_table_id=input_table_id,
+                output_table_id=output_table_id,
+                tokenizer=tokenizer,
+                token_limit=context_limit,
+                offset=(page_num - 1) * DEFAULT_FETCH_LIMIT,
+                limit=limit
+            )
+            processed += ret["processed"]
+            hits += ret["hits"]
+            pipeline_logger.info(f"Processed {processed} rows so far, with {hits} hits")
+            page_num += 1
+        except JamaiException as e:
+            if e.status_code == 404:
+                break
+            raise
+    if hits == 0:
+        pipeline_logger.info("No rows with payment card info found")
+        # delete output table
+        jamai.table.delete_table(table_type=TABLE_TYPE, table_id=output_table_id)
+        return ""
+    return output_table_id
+
+def main():
+    """Command line interface for the script."""
+    parser = argparse.ArgumentParser(
+        description="Filter rows needing masking from input table and chunk segments."
+    )
+    parser.add_argument("--input-table", default=None, 
+                       help=f"Specify input table name (e.g., {INPUT_TABLE_PREFIX}YYYYMMDD_HHMMSS)")
+    parser.add_argument("--limit", type=int, default=None, 
+                       help="Limit total rows to process")
+    parser.add_argument("--context-limit", type=int, default=DEFAULT_CONTEXT_LIMIT,
+                       help=f"Token limit per chunk. Default: {DEFAULT_CONTEXT_LIMIT}")
+    
+    args = parser.parse_args()
+    
+    try:
+        output_table = run_mask_chunk_step(
+            input_table_id=args.input_table,
+            context_limit=args.context_limit,
+            row_limit=args.limit
+        )
+        if output_table == "":
+            pipeline_logger.info("No rows with payment card info found")
+            sys.exit(10)
+        pipeline_logger.info(f"Successfully created output table: {output_table}")
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"Error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

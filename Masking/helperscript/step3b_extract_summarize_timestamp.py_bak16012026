@@ -1,0 +1,542 @@
+from __future__ import annotations
+
+import argparse
+import json5
+import os
+import re
+import sys
+import json
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+from loguru import logger
+
+from dotenv import load_dotenv
+from jamaibase import JamAI, protocol as p
+from jamaibase.exceptions import ResourceNotFoundError
+
+load_dotenv()
+
+PROJECT_ID = os.getenv("PROJECT_ID", "")
+API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+
+def _safe_json(text: str) -> Any:
+    if not text:
+        return None
+    # 1. Parse with JSON5
+    try:
+        return json5.loads(text)
+    except Exception as e:
+        logger.error(f"Failed to parse JSON: {text}, err: {str(e)}")
+        return None
+    
+def _extract_timestamps(timestamp_data):
+    """Extract the JSON array of timestamps from the Combined field."""
+    if not timestamp_data:
+        return []
+    pattern = r'<Conclusion>\s*(.*?)\s*</Conclusion>'
+    match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE) # Case-insensitive tag matching
+    if not match:
+        logger.warning("    No Machine_Readable_Output found in timestamp data")
+        return []
+    json_str = match.group(1).strip()
+    timestamps = _safe_json(json_str)
+    return timestamps
+
+def _extract_value(field: Any) -> Any:
+    return field.get("value") if isinstance(field, dict) else field
+
+def _within_time(time: float, start_time: float, end_time: float, tolerance: float = 1) -> bool:
+    """Check if time is within start_time and end_time, inclusive. with a tolerance of 1s"""
+    return start_time - tolerance <= time <= end_time + tolerance
+
+def _log_dict(data, message="", level="info"):
+    """Pretty print dictionary with Loguru"""
+    formatted = json.dumps(data, indent=2, default=str)
+    if message:
+        formatted = f"{message}\n{formatted}"
+    
+    if level == "debug":
+        logger.debug("{}", formatted)
+    elif level == "warning":
+        logger.warning("{}", formatted)
+    elif level == "error":
+        logger.error("{}", formatted)
+    else:
+        logger.info("{}", formatted)
+
+def _get_table_tows(table_id: str) -> list[dict[str, Any]]:
+    jamai = JamAI(project_id=PROJECT_ID, api_base=API_BASE)
+    try:
+        table = jamai.table.get_table(table_type=p.TableType.action, table_id=table_id)
+        table_total_rows = table.num_rows
+        offset = 0
+        _row_num = 0
+        all_rows: list[dict[str, Any]] = []
+        while _row_num < table_total_rows:
+            rows = jamai.table.list_table_rows(
+                table_type=p.TableType.action,
+                table_id=table_id,
+                columns=[
+                    "file_path",
+                    "Timestamp_to_mask",
+                ],
+                offset=offset,
+            )
+            all_rows.extend(rows.items)
+            offset += len(rows.items)
+            _row_num += len(rows.items)
+        return all_rows
+    except ResourceNotFoundError:
+        raise ResourceNotFoundError(f"Table '{table_id}' not found")
+    
+def _merge_timestamp(timestamps: List[Dict[str, Any]]):
+    """Merge overlapping timestamps."""
+    if not timestamps:
+        return []
+    
+    # Sort by start time
+    timestamps = sorted(timestamps, key=lambda x: x.get("start", 0))
+
+    timestamps = [ts for ts in timestamps if ts.get("start", None) and ts.get("end", None)]
+    
+    merged = []
+    current = timestamps[0].copy()
+    
+    for i in range(1, len(timestamps)):
+        next_ts = timestamps[i]
+        current_end = current.get("end", 0)
+        next_start = next_ts.get("start", 0)
+        
+        # If current and next overlap or are adjacent (within tolerance)
+        if current_end + 1 >= next_start:  # 1 second tolerance for adjacency
+            # Merge by taking the maximum end time
+            current["end"] = max(current_end, next_ts.get("end", 0))
+        else:
+            merged.append(current)
+            current = next_ts.copy()
+    
+    merged.append(current)
+    return merged
+
+def _is_subset(ts1: Dict[str, Any], ts2: Dict[str, Any], tolerance: float = 1.0) -> bool:
+    """
+    Check if timestamp ts1 is a subset of ts2 (or vice versa) within tolerance.
+    Returns True if either timestamp is contained within the other.
+    """
+    start1, end1 = ts1.get("start", 0), ts1.get("end", 0)
+    start2, end2 = ts2.get("start", 0), ts2.get("end", 0)
+    
+    # Check if ts1 is subset of ts2 (with tolerance)
+    if (start1 + tolerance >= start2 and end1 - tolerance <= end2):
+        return True
+    
+    # Check if ts2 is subset of ts1 (with tolerance)
+    if (start2 + tolerance >= start1 and end2 - tolerance <= end1):
+        return True
+    
+    return False
+
+def _timestamps_match(ts1: Dict[str, Any], ts2: Dict[str, Any], tolerance: float = 1.0) -> bool:
+    """
+    Check if two timestamps match based on start/end times with tolerance.
+    They match if either is a subset of the other.
+    """
+    return _is_subset(ts1, ts2, tolerance)
+
+def _process_table(table_id: str) -> Dict[str, Any]:
+    """Process a single table and return the summary."""
+    table_rows = _get_table_tows(table_id)
+    grouped = {}
+    for r in table_rows:
+        key = _extract_value(r.get("file_path")).split("/")[-1]
+        if key:
+            grouped.setdefault(key, []).append(r)
+    logger.info(f"Found {len(grouped)} unique file groups to process.")
+    
+    summary = {}
+    for idx, (row_key, chunk_rows) in enumerate(grouped.items(), 1):
+        logger.info(f"Processing group {row_key}...")
+        summary[row_key] = []
+        for r in chunk_rows:
+            timestamps = _extract_timestamps(_extract_value(r.get("Timestamp_to_mask")))
+            if not timestamps:
+                continue
+            summary[row_key].extend(timestamps)
+        
+        # Sort the timestamps by start time
+        summary[row_key] = sorted(summary[row_key], key=lambda x: x.get("start", 0))
+        # Merge overlapping timestamps
+        summary[row_key] = _merge_timestamp(summary[row_key])
+    
+    return summary
+
+def _generate_single_table_html_report(summary: Dict[str, Any], output_file: str, table_name: str = "Table"):
+    """Generate an HTML report for a single table."""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Timestamp Report - {table_name}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .file-section {{ margin: 20px 0; padding: 10px; border: 1px solid #ccc; background-color: #f8f9fa; }}
+            .timestamp-row {{ display: flex; margin: 5px 0; }}
+            .timestamp {{ flex: 1; padding: 5px; border: 1px solid #ddd; background-color: #e9ecef; }}
+            .summary {{ background-color: #e2e3e5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+            .timestamp-details {{ font-size: 12px; color: #666; }}
+            .file-header {{ background-color: #007bff; color: white; padding: 10px; border-radius: 5px; }}
+        </style>
+    </head>
+    <body>
+        <h1>Timestamp Report - {table_name}</h1>
+        <div class="summary">
+            <h2>Summary Statistics</h2>
+            <p>Total Files: {len(summary)}</p>
+            <p>Total Timestamp Segments: {sum(len(timestamps) for timestamps in summary.values())}</p>
+            <p>Average Segments per File: {sum(len(timestamps) for timestamps in summary.values()) / len(summary) if summary else 0:.2f}</p>
+            <p>Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+    """
+    
+    for file_path, timestamps in summary.items():
+        html_content += f"""
+        <div class="file-section">
+            <div class="file-header">
+                <h3>{file_path}</h3>
+                <p>Total segments: {len(timestamps)}</p>
+            </div>
+            <div class="timestamp-grid">
+                <div class="timestamp-row">
+                    <div class="timestamp"><strong>Start Time</strong></div>
+                    <div class="timestamp"><strong>End Time</strong></div>
+                    <div class="timestamp"><strong>Duration</strong></div>
+                </div>
+        """
+        
+        for ts in timestamps:
+            start_time = ts.get("start", 0)
+            end_time = ts.get("end", 0)
+            duration = end_time - start_time
+            
+            html_content += f"""
+                <div class="timestamp-row">
+                    <div class="timestamp">{start_time:.1f}s</div>
+                    <div class="timestamp">{end_time:.1f}s</div>
+                    <div class="timestamp">{duration:.1f}s</div>
+                </div>
+            """
+        
+        html_content += """
+            </div>
+        </div>
+        """
+    
+    html_content += """
+    </body>
+    </html>
+    """
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+def _generate_html_report(comparison_result: Dict[str, Any], output_file: str):
+    """Generate an HTML side-by-side comparison report."""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Timestamp Comparison Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .file-section {{ margin: 20px 0; padding: 10px; border: 1px solid #ccc; }}
+            .perfect {{ background-color: #d4edda; }}
+            .partial {{ background-color: #fff3cd; }}
+            .mismatch {{ background-color: #f8d7da; }}
+            .only {{ background-color: #e2e3e5; }}
+            .match-row {{ display: flex; margin: 5px 0; }}
+            .timestamp {{ flex: 1; padding: 5px; border: 1px solid #ddd; }}
+            .overlap {{ width: 100px; text-align: center; padding: 5px; }}
+            .match {{ background-color: #d4edda; }}
+            .no-match {{ background-color: #f8d7da; }}
+            .summary {{ background-color: #f8f9fa; padding: 15px; border-radius: 5px; }}
+            .timestamp-details {{ font-size: 12px; color: #666; }}
+        </style>
+    </head>
+    <body>
+        <h1>Timestamp Comparison Report</h1>
+        <div class="summary">
+            <h2>Summary Statistics</h2>
+            <p>Total Files: {comparison_result['summary']['total_files']}</p>
+            <p>Files in Both Tables: {comparison_result['summary']['files_in_both']}</p>
+            <p>Perfect Matches: {comparison_result['summary']['perfect_matches']}</p>
+            <p>Partial Matches: {comparison_result['summary']['partial_matches']}</p>
+            <p>Complete Mismatches: {comparison_result['summary']['complete_mismatches']}</p>
+        </div>
+    """
+    
+    for file_path, file_data in comparison_result["files"].items():
+        status_class = {
+            "perfect_match": "perfect",
+            "partial_match": "partial",
+            "complete_mismatch": "mismatch",
+            "only_in_table1": "only",
+            "only_in_table2": "only"
+        }.get(file_data["status"], "")
+        
+        html_content += f"""
+        <div class="file-section {status_class}">
+            <h3>{file_path} - {file_data['status'].replace('_', ' ').title()}</h3>
+            <p>Table 1: {file_data['stats']['table1_count']} timestamps | 
+               Table 2: {file_data['stats']['table2_count']} timestamps | 
+               Matched: {file_data['stats']['matched_count']}</p>
+            
+            <div class="comparison-grid">
+                <div class="match-row">
+                    <div class="timestamp"><strong>Table 1 Timestamps</strong></div>
+                    <div class="overlap"><strong>Overlap %</strong></div>
+                    <div class="timestamp"><strong>Table 2 Timestamps</strong></div>
+                </div>
+        """
+        
+        for match in file_data["side_by_side"]["matches"]:
+            ts1 = match["table1"]
+            ts2 = match["table2"]
+            overlap = match["overlap_percentage"]
+            
+            ts1_str = f"{ts1['start']:.1f}s - {ts1['end']:.1f}s" if ts1 else "MISSING"
+            ts2_str = f"{ts2['start']:.1f}s - {ts2['end']:.1f}s" if ts2 else "MISSING"
+            match_class = "match" if ts1 and ts2 and overlap > 0 else "no-match"
+            
+            html_content += f"""
+                <div class="match-row {match_class}">
+                    <div class="timestamp">{ts1_str}</div>
+                    <div class="overlap">{overlap:.1f}%</div>
+                    <div class="timestamp">{ts2_str}</div>
+                </div>
+            """
+        
+        html_content += """
+            </div>
+        </div>
+        """
+    
+    html_content += """
+    </body>
+    </html>
+    """
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+def _compare_summaries(summary1: Dict[str, Any], summary2: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare two summaries and return comparison results with side-by-side structure."""
+    comparison = {
+        "metadata": {
+            "table1_files": len(summary1),
+            "table2_files": len(summary2),
+            "comparison_date": datetime.now().isoformat()
+        },
+        "files": {},
+        "summary": {
+            "total_files": 0,
+            "files_in_both": 0,
+            "files_only_in_table1": 0,
+            "files_only_in_table2": 0,
+            "perfect_matches": 0,
+            "partial_matches": 0,
+            "complete_mismatches": 0
+        }
+    }
+    
+    all_files = set(summary1.keys()) | set(summary2.keys())
+    comparison["summary"]["total_files"] = len(all_files)
+    
+    for file_path in sorted(all_files):  # Sort for consistent ordering
+        file_data = {
+            "side_by_side": {
+                "table1_timestamps": summary1.get(file_path, []),
+                "table2_timestamps": summary2.get(file_path, []),
+                "matches": []
+            },
+            "status": "",
+            "stats": {
+                "table1_count": len(summary1.get(file_path, [])),
+                "table2_count": len(summary2.get(file_path, [])),
+                "matched_count": 0,
+                "unmatched_table1_count": 0,
+                "unmatched_table2_count": 0
+            }
+        }
+        
+        if file_path in summary1 and file_path in summary2:
+            comparison["summary"]["files_in_both"] += 1
+            
+            ts1_list = summary1[file_path]
+            ts2_list = summary2[file_path]
+            
+            # Create side-by-side comparison
+            matched_ts1 = set()
+            matched_ts2 = set()
+            
+            for i, ts1 in enumerate(ts1_list):
+                best_match = None
+                best_match_idx = -1
+                
+                for j, ts2 in enumerate(ts2_list):
+                    if j not in matched_ts2 and _timestamps_match(ts1, ts2):
+                        # Find the best match (most overlapping)
+                        overlap = _calculate_overlap(ts1, ts2)
+                        if best_match is None or overlap > best_match["overlap"]:
+                            best_match = {
+                                "table2_index": j,
+                                "table2_timestamp": ts2,
+                                "overlap": overlap
+                            }
+                            best_match_idx = j
+                
+                if best_match:
+                    matched_ts1.add(i)
+                    matched_ts2.add(best_match_idx)
+                    file_data["side_by_side"]["matches"].append({
+                        "table1": ts1,
+                        "table2": best_match["table2_timestamp"],
+                        "overlap_percentage": best_match["overlap"]
+                    })
+            
+            # Add unmatched timestamps
+            for i, ts1 in enumerate(ts1_list):
+                if i not in matched_ts1:
+                    file_data["side_by_side"]["matches"].append({
+                        "table1": ts1,
+                        "table2": None,
+                        "overlap_percentage": 0
+                    })
+            
+            for j, ts2 in enumerate(ts2_list):
+                if j not in matched_ts2:
+                    file_data["side_by_side"]["matches"].append({
+                        "table1": None,
+                        "table2": ts2,
+                        "overlap_percentage": 0
+                    })
+            
+            # Sort matches by start time for better readability
+            file_data["side_by_side"]["matches"].sort(key=lambda x: 
+                x["table1"]["start"] if x["table1"] else 
+                x["table2"]["start"] if x["table2"] else 0)
+            
+            # Update stats
+            file_data["stats"]["matched_count"] = len(matched_ts1)
+            file_data["stats"]["unmatched_table1_count"] = len(ts1_list) - len(matched_ts1)
+            file_data["stats"]["unmatched_table2_count"] = len(ts2_list) - len(matched_ts2)
+            
+            # Determine status
+            if file_data["stats"]["unmatched_table1_count"] == 0 and file_data["stats"]["unmatched_table2_count"] == 0:
+                file_data["status"] = "perfect_match"
+                comparison["summary"]["perfect_matches"] += 1
+            elif file_data["stats"]["matched_count"] > 0:
+                file_data["status"] = "partial_match"
+                comparison["summary"]["partial_matches"] += 1
+            else:
+                file_data["status"] = "complete_mismatch"
+                comparison["summary"]["complete_mismatches"] += 1
+                
+        elif file_path in summary1:
+            comparison["summary"]["files_only_in_table1"] += 1
+            file_data["status"] = "only_in_table1"
+            # Add all table1 timestamps as unmatched
+            for ts1 in summary1[file_path]:
+                file_data["side_by_side"]["matches"].append({
+                    "table1": ts1,
+                    "table2": None,
+                    "overlap_percentage": 0
+                })
+        else:
+            comparison["summary"]["files_only_in_table2"] += 1
+            file_data["status"] = "only_in_table2"
+            # Add all table2 timestamps as unmatched
+            for ts2 in summary2[file_path]:
+                file_data["side_by_side"]["matches"].append({
+                    "table1": None,
+                    "table2": ts2,
+                    "overlap_percentage": 0
+                })
+        
+        comparison["files"][file_path] = file_data
+    
+    return comparison
+
+def _calculate_overlap(ts1: Dict[str, Any], ts2: Dict[str, Any]) -> float:
+    """Calculate overlap percentage between two timestamps."""
+    start1, end1 = ts1.get("start", 0), ts1.get("end", 0)
+    start2, end2 = ts2.get("start", 0), ts2.get("end", 0)
+    
+    overlap_start = max(start1, start2)
+    overlap_end = min(end1, end2)
+    
+    if overlap_start >= overlap_end:
+        return 0.0
+    
+    overlap_duration = overlap_end - overlap_start
+    ts1_duration = end1 - start1
+    ts2_duration = end2 - start2
+    
+    # Return the maximum overlap percentage relative to either timestamp
+    return max(overlap_duration / ts1_duration, overlap_duration / ts2_duration) * 100
+
+def main(args):
+    if args.compare_table:
+        # Comparison mode
+        logger.info(f"Processing first table: {args.step3b}")
+        summary1 = _process_table(args.step3b)
+        
+        logger.info(f"Processing second table: {args.compare_table}")
+        summary2 = _process_table(args.compare_table)
+        
+        logger.info("Comparing tables...")
+        comparison_result = _compare_summaries(summary1, summary2)
+        
+        # Save comparison to JSON file
+        output_file = args.output or "compare.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(comparison_result, f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.info(f"Comparison saved to {output_file}")
+
+        # Generate additional reports if requested
+        if args.html_report:
+            html_file = args.html_report
+            _generate_html_report(comparison_result, html_file)
+            logger.info(f"HTML report saved to {html_file}")
+        
+        # Log summary statistics
+        stats = comparison_result["summary"]
+        logger.info(f"\nComparison Summary:")
+        logger.info(f"  Perfect matches: {stats['perfect_matches']}")
+        logger.info(f"  Partial matches: {stats['partial_matches']}")
+        logger.info(f"  Complete mismatches: {stats['complete_mismatches']}")
+        
+    else:
+        # Single table mode (original functionality)
+        summary = _process_table(args.step3b)
+        logger.info(f"Done processing {len(summary)} groups.")
+        _log_dict(summary, level="info")
+        
+        # Generate HTML report for single table if requested
+        if args.html_report:
+            html_file = args.html_report
+            _generate_single_table_html_report(summary, html_file, f"Table {args.step3b}")
+            logger.info(f"Single table HTML report saved to {html_file}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Summarize the timestamps to be masked for each input voice file."
+    )
+    parser.add_argument("--step3b", required=True, help="First table ID to process")
+    parser.add_argument("--compare-table", help="Second table ID for comparison mode")
+    parser.add_argument("--output", "-o", help="Output JSON file for comparison results (default: compare.json)")
+    parser.add_argument("--html-report", help="Generate HTML report (works for both single table and comparison modes)")
+    
+    args = parser.parse_args()
+
+    main(args)

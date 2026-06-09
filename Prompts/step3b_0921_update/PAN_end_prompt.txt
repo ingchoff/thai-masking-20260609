@@ -1,0 +1,149 @@
+# 🎯 PAN Detection & Masking Protocol (v3.1)
+*Timestamp-first. Trust analysis. Match digits to word timestamps. List all matches.*
+
+---
+
+## ⚖️ Core Rules — Simplified
+
+- **Only mask digit sequences (or Thai numeral equivalents) identified in `<PAN identified>`**
+- **Use word-level timestamps as ground truth.** Transcript text is irrelevant for timing.
+- **Match the exact digit/numeral string from `<PAN identified>` against each timestamped line.**
+- **Multiple matches? List them all.**
+- **Thai words for numbers (e.g., “ห้า”, “เจ็ด”) count if they spell out the PAN numerically.**
+- **Split across lines? Still match — as long as concatenated tokens reconstruct the PAN.**
+- **Never guess. Never validate context. Trust the analysis.**
+
+---
+
+## ✅ 2-Step Workflow
+
+---
+
+### Step 1) Match PAN Against Word Timestamp Lines
+
+- Take the PAN string(s) from `<PAN identified>`.
+- For each line in `<word level timestamp>`:
+- Normalize: strip angle brackets, split timestamp from tokens.
+- Concatenate all tokens in the line (space-joined) → candidate string.
+- Check if PAN string appears *exactly* in candidate string.
+- ✅ Match → record end time of that line.
+- ❌ No match → skip.
+- Also check **consecutive lines**:
+- If PAN spans multiple lines (e.g., “ห้า” + “เจ็ด หนึ่ง” = “571”), concatenate their tokens and check for match.
+- Use the **end time of the last line in the sequence**.
+
+→ Output every match. No filtering. No context validation. Trust the analysis.
+
+---
+
+### Step 2) Output End Time — No Offset, No Buffer
+
+- For each match:
+- End time = the `t1` (left timestamp) of the first line containing the first part of the PAN.
+- **Do NOT add offset. Do NOT adjust.** Even if digits end mid-line — use raw line end time.
+- Why? Audio alignment is trusted. Offsets introduce error. Analysis already confirmed it’s PAN.
+
+---
+
+## 📤 Output Format (Unchanged)
+
+<Reasoning>
+[For each match: state which timestamp line(s) contained the PAN, and why it matched (e.g., “exact match in line 2”, “spanned lines 3–4: ‘ห้า’ + ‘เจ็ดหนึ่ง’”). No context interpretation needed — just describe the match.]
+</Reasoning>
+
+<End time JSON>
+List of JSON objects:
+[
+{
+"id": <integer, starting at 1, incrementing>,
+"end": <float, raw end time from final matching timestamp line>,
+},
+]
+** If no matches found, return: No matches found.
+</End time JSON>
+
+---
+
+## 💡 Examples — Rewritten for Clarity
+
+---
+
+### ✅ FS-1: Exact Match at Line End
+
+<PAN identified>
+4111111111111111
+</PAN identified>
+
+<word level timestamp>
+<299.07:300.35> 4111 1111 1111 1111
+
+→ Match: exact in line.
+→ End = 300.35
+
+---
+
+### ✅ FS-2: PAN Mid-Line — Use 2nd Line End
+
+<PAN identified>
+5555555555554444
+</PAN identified>
+
+<word level timestamp>
+<1057.94:1060.72> the number 5555
+<1061.02:1064.00> 5555 5555 4444
+
+→ Match: spans two lines. Last part in line 1.
+→ End = 1064.00 (second line’s end)
+
+---
+
+### ✅ FS-3: Thai Numerals, Split Across Lines
+
+<PAN identified>
+571
+</PAN identified>
+
+<word level timestamp>
+<89.92:90.76> ห้า
+<91.26:91.8> เจ็ด หนึ่ง
+
+→ Match: “ห้าเจ็ดหนึ่ง” = “571”
+→ End = 91.8 (final line)
+
+---
+
+### ✅ FS-4: Multiple Matches
+
+<PAN identified>
+1451458
+</PAN identified>
+
+<word level timestamp>
+<347.11:347.83> ๋อ เป็น
+<347.64:350.76> 1451458
+<355.10:356.00> 1451458
+
+→ Two matches: lines 2 and 3.
+→ Output two JSON objects: Ends 350.76 and 356.00
+
+---
+
+## ⚠️ What NOT to Do
+
+- ✖️ Don’t check if it’s “in financial context” — analysis already did.
+- ✖️ Don’t validate length (13–19 digits) — trust analysis.
+- ✖️ Don’t add offset or buffer — raw timestamp only.
+- ✖️ Don’t skip matches because of time gaps — if analysis says it’s PAN, and tokens match, include it.
+- ✖️ Don’t mask anything not in `<PAN identified>`.
+
+---
+
+## 📥 Input Format
+
+<Analysis>
+${Occurrence}
+</Analysis>
+
+<Word level Timestamp>
+${WordTimeStamp}
+</Word level Timestamp>

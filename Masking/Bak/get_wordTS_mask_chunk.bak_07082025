@@ -1,0 +1,502 @@
+"""
+Step 3b of masking pipeline: Process timestamp data with additional filtering and word level timestamp from input tables.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json5
+import os
+import re
+import sys
+import traceback
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+from jamaibase import JamAI, protocol as p
+from jamaibase.exceptions import JamaiException, ResourceNotFoundError
+
+try:
+    from Masking.logging_utils import LOGGER as _BASE_LOGGER
+except ImportError:
+    from logging_utils import LOGGER as _BASE_LOGGER
+
+_LOG = _BASE_LOGGER.bind(type="pipeline", service_name="get_word_timestamps")
+
+load_dotenv()
+
+def _safe_json(text: str) -> Any:
+    if not text:
+        return None
+    # 1. Parse with JSON5
+    try:
+        return json5.loads(text)
+    except Exception as e:
+        _LOG.error(f"Failed to parse JSON: {text}, err: {str(e)}")
+        return None
+    
+def _extract_timestamps(timestamp_data):
+    """Extract the JSON array of timestamps from the Timestamp_to_mask field."""
+    if not timestamp_data:
+        return []
+    pattern = r'<Machine_Readable_Output>\s*(.*?)\s*</Machine_Readable_Output>'
+    match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE) # Case-insensitive tag matching
+    if not match:
+        _LOG.warning("    No Machine_Readable_Output found in timestamp data")
+        return []
+    json_str = match.group(1).strip()
+    timestamps = _safe_json(json_str)
+    return timestamps
+
+def _extract_value(field: Any) -> Any:
+    return field.get("value") if isinstance(field, dict) else field
+
+def _parse_ts(table_id: str, prefix: str) -> str | None:
+    if not table_id.startswith(prefix):
+        return None
+    ts = table_id[len(prefix) :]
+    try:
+        datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        return ts
+    except ValueError:
+        return None
+
+class _Config:
+    """Immutable configuration built once from env + CLI overrides."""
+    __slots__ = (
+        "project_id",
+        "api_base",
+        "step1_prefix",
+        "step3_prefix",
+        "out_schema_id",
+        "out_prefix",
+        "context_limit",
+        "fetch_limit",
+        "default_fetch_limit",
+        "particles",
+        "thai_digits",
+        "card_terms",
+        "keywords_to_track",
+    )
+
+    def __init__(self, cli: Optional[argparse.Namespace] = None) -> None:
+        self.project_id: str = os.getenv("PROJECT_ID", "proj_d51957697af3bcec339092cb")
+        self.api_base: str = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+        self.step1_prefix = "step1_"
+        self.step3_prefix = "step3_"
+        self.out_schema_id = "step3b"
+        self.out_prefix = "step3b_"
+        self.context_limit: int = int(os.getenv("MODEL_CONTEXT_LIMIT", "32000"))
+        self.fetch_limit: int = 100
+        self.default_fetch_limit = 100
+        
+        if cli:
+            # CLI overrides
+            self.context_limit = cli.context_limit
+
+CFG = _Config()  # default instance; CLI will mutate below
+
+class _TableResolver:
+    """Handles all table-id resolution and creation."""
+    def __init__(self, jamai: JamAI) -> None:
+        self.jamai = jamai
+
+    def discover(
+        self,
+        step1_override: Optional[str],
+        step3_override: Optional[str],
+    ) -> Tuple[str, str, str]:
+        if step1_override:
+            step1_id = step1_override
+            ts = _parse_ts(step1_id, CFG.step1_prefix) or datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            step1_id, ts = self._latest(CFG.step1_prefix)
+            if not step1_id:
+                raise ResourceNotFoundError(f"No table with prefix '{CFG.step1_prefix}'")
+        if step3_override:
+            step3_id = step3_override
+            ts = _parse_ts(step3_id, CFG.step3_prefix) or datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            step3_id, ts = self._latest(CFG.step3_prefix)
+            if not step3_id:
+                raise ResourceNotFoundError(f"No table with prefix '{CFG.step3_prefix}'")
+        out_id = f"{CFG.out_prefix}{ts}"
+        self._setup_output(out_id)
+        return step1_id, step3_id, out_id
+
+    # ---------------- internal ---------------- #
+    def _latest(self, prefix: str) -> Tuple[str | None, str | None]:
+        tables = self.jamai.table.list_tables(table_type=p.TableType.action).items
+        candidates = [
+            (datetime.strptime(ts, "%Y%m%d_%H%M%S"), tbl.id, ts)
+            for tbl in tables
+            if (ts := _parse_ts(tbl.id, prefix))
+        ]
+        if not candidates:
+            return None, None
+        _, tbl_id, ts = max(candidates, key=lambda x: x[0])
+        return tbl_id, ts
+
+    def _ensure_exists(self, table_id: str) -> None:
+        try:
+            self.jamai.table.get_table(table_type=p.TableType.action, table_id=table_id)
+        except ResourceNotFoundError:
+            raise ResourceNotFoundError(f"Step 1 table '{table_id}' not found")
+
+    def _setup_output(self, out_id: str) -> None:
+        self.jamai.table.get_table(table_type=p.TableType.action, table_id=CFG.out_schema_id)
+        try:
+            self.jamai.table.delete_table(table_type=p.TableType.action, table_id=out_id)
+        except ResourceNotFoundError:
+            pass
+        self.jamai.table.duplicate_table(
+            table_type=p.TableType.action,
+            table_id_src=CFG.out_schema_id,
+            table_id_dst=out_id,
+            include_data=False,
+        )
+
+class _Logic:
+    """All data transformation without side effects."""
+
+    # ---------- segment filtering by time ----------
+    @staticmethod
+    def _extract_wordsegment_ts(raw_ts: List[Dict[str, Any]], ts_start: float, ts_end: float) -> tuple[List[Dict], List[Dict]]:
+        list_word_segments = []
+        list_segments = []
+        for s in raw_ts:
+            if isinstance(s, dict):
+                if _Logic._within_time(ts_start, s["start"], s["end"], tolerance=5) or _Logic._within_time(ts_end, s["start"], s["end"], tolerance=5):
+                    list_word_segments.append(s.get("words", []))
+                    list_segments.append(
+                        {
+                            "start": s["start"],
+                            "end": s["end"],
+                            "text": s["text"],
+                        }
+                    )
+        # return flattened result
+        return [item for sublist in list_word_segments for item in sublist], list_segments
+    
+    @staticmethod
+    def _extract_segment_ts(raw_ts: List[Dict[str, Any]], ts_start: float, ts_end: float) -> List[Dict]:
+        list_segments = [
+            {
+                "start": s["start"],
+                "end": s["end"],
+                "text": s["text"],
+            }
+            for s in raw_ts
+            if isinstance(s, dict)
+            and (_Logic._within_time(ts_start, s["start"], s["end"], tolerance=5)
+                 or _Logic._within_time(ts_end, s["start"], s["end"], tolerance=5))
+        ]
+        if len(list_segments) == 0:
+            return []
+        # return flattened result
+        return list_segments
+    
+    @staticmethod
+    def _extract_word_ts(wordsegment_ts: List[Dict[str, Any]], ts_start: float, ts_end: float) -> List[Dict]:
+        return [
+            w
+            for w in wordsegment_ts
+            if isinstance(w, dict)
+            and (_Logic._within_time(w["start"], ts_start, ts_end) or
+            _Logic._within_time(w["end"], ts_start, ts_end))
+    ]
+    
+    @staticmethod
+    def _within_time(time: float, start_time: float, end_time: float, tolerance: float = 1) -> bool:
+        """Check if time is within start_time and end_time, inclusive. with a tolerance of 1s"""
+        return start_time - tolerance <= time <= end_time + tolerance
+
+    @staticmethod
+    def _compress_word_timestamps(data, time_threshold=0.1, max_duration=1.0, max_chars=15):
+        """
+        Compresses word-level timestamps by merging consecutive fragments that form complete words,
+        while preserving word boundaries and limiting segment duration and length.
+        
+        Args:
+            data: List of dictionaries with 'start', 'end', and 'word' keys
+            time_threshold: Maximum allowed time gap between fragments to merge (default: 0.1 seconds)
+            max_duration: Maximum duration for a merged segment (default: 1.0 seconds)
+            max_chars: Maximum character count for a merged segment (default: 15 characters)
+            
+        Returns:
+            List of compressed dictionaries with merged words and combined timestamps
+        """
+        if not data:
+            return []
+        
+        compressed = []
+        current = {
+            'start': data[0]['start'],
+            'end': data[0]['end'],
+            'word': data[0]['word']
+        }
+        
+        for next_entry in data[1:]:
+            # Calculate potential merged segment properties
+            merged_word = current['word'] + next_entry['word']
+            merged_duration = next_entry['end'] - current['start']
+            merged_chars = len(merged_word)
+            time_gap = next_entry['start'] - current['end']
+            
+            # Check if we should merge with current fragment
+            can_merge = (
+                # No word boundary (spaces) between fragments
+                not current['word'].endswith(' ') and 
+                not next_entry['word'].startswith(' ') and
+                # Time continuity
+                time_gap <= time_threshold and
+                # Duration limit
+                merged_duration <= max_duration and
+                # Character count limit
+                merged_chars <= max_chars
+            )
+            
+            if can_merge:
+                # Merge fragments
+                current['end'] = next_entry['end']
+                current['word'] = merged_word
+            else:
+                # Finalize current fragment and start new one
+                compressed.append(current)
+                current = {
+                    'start': next_entry['start'],
+                    'end': next_entry['end'],
+                    'word': next_entry['word']
+                }
+        
+        # Add the last fragment
+        compressed.append(current)
+        
+        return compressed
+
+    @staticmethod
+    def _format_word_segments(segments: List, key: str = "word") -> List:
+        lines = []
+        for seg in segments:
+            # Format timestamps to remove unnecessary trailing zeros
+            start = f"{seg['start']:.2f}".rstrip('0').rstrip('.')
+            end = f"{seg['end']:.2f}".rstrip('0').rstrip('.')
+            line = f"<{start}:{end}> {seg[key].strip()}"
+            lines.append(line)
+        return lines
+
+class _Processor:
+    def __init__(self, jamai: JamAI) -> None:
+        self.jamai = jamai
+        self.resolver = _TableResolver(jamai)
+
+    def run(
+        self,
+        *,
+        step1: Optional[str],
+        step3: Optional[str],
+        context_limit: int,
+        row_limit: Optional[int],
+    ) -> str:
+        step1_id, step3_id, out_id = self.resolver.discover(step1, step3)
+        step1_table = self.jamai.table.get_table(table_type=p.TableType.action, table_id=step1_id)
+        step3_table = self.jamai.table.get_table(table_type=p.TableType.action, table_id=step3_id)
+        rows_total = 0
+        limit = row_limit if row_limit is not None else float("inf")
+
+        step1_total_rows = step1_table.num_rows
+        step3_total_rows = step3_table.num_rows
+        offset = 0
+        _row_num = 0
+        all_rows: list[dict[str, Any]] = []
+        while _row_num < step3_total_rows:
+            step3_rows = self.jamai.table.list_table_rows(
+                table_type=p.TableType.action,
+                table_id=step3_id,
+                columns=[
+                    "file_path",
+                    "Segment_ID",
+                    "Transcription",
+                    "SegmentsAndWords",
+                    "Timestamp_to_mask",
+                ],
+                limit=CFG.default_fetch_limit,
+                offset=offset,
+            )
+            all_rows.extend(step3_rows.items)
+            offset += len(step3_rows.items)
+            _row_num += len(step3_rows.items)
+        offset = 0
+        _row_num = 0
+        input_rows: list[dict[str, Any]] = []
+        while _row_num < step1_total_rows:
+            step1_rows = self.jamai.table.list_table_rows(
+                table_type=p.TableType.action,
+                table_id=step1_id,
+                columns=[
+                    "file_path",
+                    "SegmentsAndWords", # the original segments and words without post-processing
+                ]
+            )
+            input_rows.extend(step1_rows.items)
+            offset += len(input_rows)
+            _row_num += len(input_rows)
+        grouped = {}
+        for r in all_rows:
+            key = _extract_value(r.get("file_path"))
+            if key:
+                grouped.setdefault(key, []).append(r)
+        _LOG.info(f"Found {len(grouped)} unique file groups to process.")
+        hits = 0
+        for idx, (row_key, chunk_rows) in enumerate(grouped.items(), 1):
+            input_chunks = [r for r in input_rows if _extract_value(r.get("file_path")) == row_key]
+            if rows_total >= limit:
+                _LOG.info("Row limit reached")
+                break
+            try:
+                hits += self._process_group(row_key, chunk_rows, input_chunks, out_id, context_limit)
+            except Exception as e:
+                _LOG.error(f"Error processing group {row_key}: {e}")
+                _LOG.error(traceback.format_exc())
+            rows_total += 1
+        if hits == 0:
+            _LOG.info("No credit card info detected...")
+            # remove step3b table
+            self.jamai.table.delete_table(table_type=p.TableType.action, table_id=out_id)
+            return ""
+        return out_id
+
+    # ---------- per group ----------
+    def _process_group(
+        self,
+        row_key: str,
+        rows: List,
+        input_rows: List,
+        out_id: str,
+        context_limit: int,
+    ) -> int:
+        _LOG.info(f"Processing group {row_key}")
+        first = rows[0]
+        file_path = _extract_value(first.get("file_path"))
+
+        raw_input_ts = _safe_json(_extract_value(input_rows[0].get("SegmentsAndWords")))
+        payloads = []
+        hits = 0
+        for r in rows:
+            ts_to_mask = _extract_value(r.get("Timestamp_to_mask"))
+            if not ts_to_mask:
+                _LOG.info(f"No PAN to mask for segment id: {_extract_value(r.get('Segment_ID'))}")
+                continue
+            list_ts_to_mask = _extract_timestamps(ts_to_mask)
+            if len(list_ts_to_mask) == 0:
+                _LOG.info(f"No PAN to mask for segment id: {_extract_value(r.get('Segment_ID'))}")
+                continue
+            matched_mask_with_ts = self._process_row(list_ts_to_mask=list_ts_to_mask, input_ts=raw_input_ts)
+            payloads=[]
+            for ts_to_mask, matched_ws_ts, matched_word_ts in matched_mask_with_ts:
+                payload = {
+                    "file_path": file_path,
+                    "Segment_ID": _extract_value(first.get("Segment_ID")),
+                    "Transcription": _extract_value(r.get("Transcription")),
+                    "SegmentsAndWords": matched_ws_ts,
+                    # "SegmentsAndWords": _extract_value(first.get("SegmentsAndWords")),
+                    "Segment_to_mask": json5.dumps(ts_to_mask, ensure_ascii=False),
+                    "WordTimeStamp": matched_word_ts
+                }
+                payloads.append(payload)
+            if len(payloads) > 0:
+                self.jamai.table.add_table_rows(
+                    table_type=p.TableType.action,
+                    request=p.RowAddRequest(table_id=out_id, data=payloads, stream=False),
+                )
+                hits += len(payloads)
+        return hits
+
+    def _process_row(
+        self,
+        list_ts_to_mask: List[Dict[str, Any]],
+        input_ts: List[Dict[str, Any]], # raw ts with segment + words
+    ):
+        # turn it into list of timestamp to mask
+        # ex: list of 
+        # {"start": 322.55, "end": 332.43, "type": "FULL-PAN", "description": "Caller re-reading the credit card number after being informed it was incomplete"}
+        match_ts = []
+        match_ws_ts = []
+        for ts_to_mask in list_ts_to_mask:
+            ts_start = ts_to_mask["start"]
+            ts_end = ts_to_mask["end"]
+            _wordsegment_ts_raw, _segment_ts_raw = _Logic._extract_wordsegment_ts(input_ts, ts_start, ts_end)
+            # _segment_ts_raw = _Logic._extract_segment_ts(input_ts, ts_start, ts_end)
+            _word_ts = _Logic._extract_word_ts(_wordsegment_ts_raw, ts_start, ts_end)
+            _compressed_word_ts = _Logic._compress_word_timestamps(_word_ts)
+            _formatted_segments_ts = _Logic._format_word_segments(_segment_ts_raw, "text")
+            _formatted_word_ts = _Logic._format_word_segments(_compressed_word_ts)
+            match_ws_ts.append("\n".join(_formatted_segments_ts))
+            match_ts.append("\n".join(_formatted_word_ts))
+        return zip(list_ts_to_mask, match_ws_ts, match_ts, strict=True)
+
+def run_get_word_ts_step_pipeline(
+    tasks: List[Dict[str, Any]],
+    input_table_step1: Optional[str] = None,
+    input_table_step3: Optional[str] = None,
+    context_limit: int = CFG.context_limit,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None,
+) -> Dict[str, Any]:
+    try:
+        jamai = jamai_client or JamAI(project_id=CFG.project_id, api_base=CFG.api_base)
+        processor = _Processor(jamai)
+        table_id = processor.run(
+            step1=input_table_step1,
+            step3=input_table_step3,
+            context_limit=context_limit,
+            row_limit=row_limit,
+        )
+        return {"tasks": tasks, "table_id": table_id, "stats": {"status": "success", "message": "Success"}}
+    except Exception as e:
+        return {"tasks": tasks, "table_id": None, "stats": {"status": "failed", "message": str(e)}}
+
+def run_get_word_ts_step(
+    input_table_step1: Optional[str] = None,
+    input_table_step3: Optional[str] = None,
+    context_limit: int = CFG.context_limit,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None,
+) -> str:
+    jamai = jamai_client or JamAI(project_id=CFG.project_id, api_base=CFG.api_base)
+    return _Processor(jamai).run(
+        step1=input_table_step1,
+        step3=input_table_step3,
+        context_limit=context_limit,
+        row_limit=row_limit,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Fetch detailed segments based on phase analysis, process/reduce them, and upload to a timestamped output table."
+    )
+    parser.add_argument("--input-table-step1", default=None)
+    parser.add_argument("--input-table-step3", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--context-limit", type=int, default=CFG.context_limit)
+    args = parser.parse_args()
+
+    # update global config with CLI values
+    CFG = _Config(args)
+
+    try:
+        tid = run_get_word_ts_step(
+            input_table_step1=args.input_table_step1,
+            input_table_step3=args.input_table_step3,
+            context_limit=args.context_limit,
+            row_limit=args.limit,
+        )
+        if tid == "":
+            _LOG.info("No rows with payment card info found")
+            sys.exit(30)
+        _LOG.info(f"Finished. Output table: {tid}")
+    except Exception as e:
+        _LOG.error(str(e))
+        sys.exit(1)

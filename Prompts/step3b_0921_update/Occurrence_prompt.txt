@@ -1,0 +1,71 @@
+# 🧾 FINAL: THAILAND-SPECIFIC CREDIT CARD PAN IDENTIFICATION MANUAL
+
+### ✅ Supports Arabic Numerals AND Thai Digit Words — EVEN WHEN GLUED, MIS-ASR’D, OR MIXED WITH TEXT
+### ✅ Legal Compliance First — If Context Says It’s a Card Number, You MUST Flag the Token
+### ✅ Downstream Masking Will Handle It — Your Job Is to Identify, Not Clean
+### ✅ Treat Thai digit words and Arabic digits interchangeably.
+
+---
+
+## ✅ STEP 0: LEGAL & TECHNICAL CONTEXT (THAILAND) — UPDATED
+
+> Under **PDPA** and **BOT guidelines**, **you must identify ANY token — no matter how messy — that context confirms refers to a payment card number.**
+>
+> - Even if it’s glued with “ครับ”, “นะ”, “ส”, etc.
+> - Even if it starts with “้า” or ends with “จ้า”
+> - Even if it’s only part of the number
+> - Even if it’s mis-segmented or mis-ASR’d
+>
+> ❗ **Failure to flag = compliance violation.**
+
+---
+
+## 🔍 STEP 1: Match Tokens from word level timestamp
+
+> **Inputs**: Credit card number found in the <Number Identify> from [[ ## summary ## ]]. And find the corresponding appearances Under the [[ ## Word Level Timestamp ## ]] section
+> **Goal**: Utilizing the credit card number found in step1 (if any), carefully match it to the lines under word level timestamp section
+> **Matching Guidelines:
+- For each credit card number found in step 1. Do your best to match it with lines under word level timestamp section.
+- The word level timestamp is a more focused (time-constrained) segments of the transcription, therefore, it's just a subset of the transcription
+- In the word level timestamp, there can be ASR corruption and stitching problems resulting in loss of characters/digits.
+- Bear in mind, due to the stitching algorithm, the digits may be disjointed into multiples lines.
+- Use the timing information as the first signal to match numbers, and then the surrounding lines to ensure you are matching the correct appearances.
+- Remember by matching numbers, it needs not be just Arabic numbers, Thai digits, or Thai words are essentially the same.
+
+---
+
+## 🏷️ STEP 2: Label and put under output section
+
+> **Goal**: From the matched tokens from step 1 organize it into the output section
+> **Output Format:**
+- The matched tokens from word level timestamps needs to be put into the <PAN identified> section, line-by-line
+- IMPORTANT: when list under the <PAN identified> section, use EXACTLY how it is written in the word level timestamp. DO NOT attempt to correct it or change it.
+- IMPORTANT: You are going to identified numbers. If the line is just like "Here are the 16 digits credit card number", this means that it's totally not needed to be masked Because it has not real credit card number.
+
+---
+
+## 📄 STEP 3: OUTPUT FORMAT
+
+<matching>
+... walkthrough of the matching process ...
+</matching>
+
+<PAN identified>
+[One raw token per line — exactly as seen in <word level timestamp>. No cleaning. No trimming. Even if it includes “ครับ”, “ส”, “้า”, etc.]
+</PAN identified>
+
+---
+
+## ⚖️ LEGAL COMPLIANCE NOTE (THAILAND — FINAL)
+
+> Under **PDPA** and **BOT guidelines**, **any representation of a PAN — whether numeric or verbal — must be identified and protected** if it can be linked to a payment card. Failure to identify Thai digit word tokens (e.g., “ศูนย์สองหกสาม”) when context confirms they represent a PAN constitutes a compliance gap.
+
+---
+
+## Input:
+
+[[ ## Summary ## ]]
+${Summary}
+
+[[ ## Word Level Timestamp ## ]]
+${WordTimeStamp}

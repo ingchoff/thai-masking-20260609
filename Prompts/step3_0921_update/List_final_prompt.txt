@@ -1,0 +1,255 @@
+### 📝 Instruction for Merging Two Lists of Time-Stamped Entries (with Thai National ID Detection + Conversation-Wide Context — REVISED FOR SEMANTIC AMBIGUITY & SPLIT-NUMBER HANDLING)
+
+You are given:
+- A full conversation transcript inside <conversation>.
+- Two lists of time-stamped dialogue entries: List A and List B, inside <listA> and <listB>.
+
+Each entry in List A or B is a JSON-like object with fields:
+id, speaker, context, tags, to_drop, start, end.
+
+Your task is to merge List A and List B into one unified list, while leveraging the full conversation context — especially to accurately detect Thai National IDs and embed detection findings directly into the merged context.
+
+> 🔄 Critical Flow Reminder:
+> 1. Match entries → 2. Detect Thai ID using full conversation → 3. Write merged context (including ID findings) → 4. Set to_drop → 5. Finalize & sort.
+
+---
+
+### ✅ Step 1: Understand the Goal
+
+Produce one final list that:
+1. Includes all information from both List A and List B (union).
+2. Removes duplicate entries (do not repeat the same event).
+3. When entries overlap in time, combine them so that the resulting time range covers the full duration.
+4. Detect Thai National IDs using the full conversation — embed findings in context.
+5. Flag confirmed Credit/Payment card entries (using tag information) → set "to_drop": false. All others → "to_drop": true.
+
+> 🎯 Final list must be:
+> - Complete, non-redundant, temporally accurate.
+> - Contexts must reflect Thai ID detection findings — even if misleading terms like “card number” are used.
+> - Drop flags must be validated against full conversation semantics, not just keywords.
+
+---
+
+### ✅ Step 2: Match Entries by Time and Speaker — STRICT 1:1 MERGE
+
+To determine if two entries (one from A, one from B) refer to the same event:
+- Compare their start, end, and speaker.
+- If all three are within 0.01 seconds (for times) and the speaker matches → they represent the same segment.
+- Use this as the primary key: (round(start, 2), round(end, 2), speaker)
+
+> 🔍 Example:
+> A: start=1050.37, end=1052.11, speaker="Caller"
+> B: start=1050.37, end=1052.11, speaker="Caller" → ✅ Same event
+
+> ⚠️ CRITICAL: Only merge if BOTH start AND end timestamps match within 0.01s. Do NOT merge entries that are adjacent or overlapping but not identical in time boundaries. Each merge must be 1:1 — one A with one B — never merge multiple A’s with multiple B’s into one long entry.
+
+---
+
+### ✅ Step 3: For Each Matched Pair — Detect Thai ID BEFORE Writing Context
+
+⚠️ Thai ID detection must happen BEFORE you write the merged context — so findings can be embedded.
+
+#### A. Gather Raw Materials
+- Collect both context strings from A and B.
+- Note all tags from both.
+- Note the time window: start = min(A.start, B.start), end = max(A.end, B.end)
+
+#### B. Thai National ID Detection — Conversation-Aware & SEMANTICALLY ROBUST
+
+Scan both raw contexts AND the full <conversation> transcript for Thai ID indicators — prioritize semantic intent over literal keywords.
+
+✅ Positive indicators (ANY of these present = likely Thai ID):
+- Contains keywords:
+"ID", "citizen ID", "เลขบัตรประชาชน", "national ID", "identification", "13 หลัก", "ID card number", "ID number", "ID card"
+- Contains a 12–13 digit number (allow ±1 digit for transcription error)
+- That number starts with 1, 2, 3, 4, 5, 6, 7, or 8
+- That number does NOT start with 0 or 9
+
+🔶 CRITICAL SEMANTIC OVERRIDE RULE (UPDATED & CLARIFIED):
+
+> 🚨 ALWAYS CHECK IF THE CALLER OR AGENT EXPLICITLY ASKED FOR A “13-DIGIT NUMBER” OR REFERENCED “13 หลัก” — THIS IS THE STRONGEST SIGNAL FOR THAI ID.
+
+→ If the conversation explicitly requests or refers to:
+- “เลขบัตรประชาชน”
+- “บัตรประชาชน”
+- “13 หลัก”
+- “บัตรที่มี 13 หลัก”
+- “หมายเลขบัตร 13 หลัก”
+- Or mentions “missing 1 digit” when 12 digits are provided → e.g.,
+[Agent]: “ที่คุณแจ้งมามีแค่สิบสองหลักครับ ขาดไปหนึ่งหลัก”
+→ This implies the expected number is 13 digits, hence Thai National ID.
+
+→ Then: ANY number provided in that context is a Thai National ID — EVEN IF the speaker calls it “card number”, “หมายเลขบัตร”, or stumbles while speaking.
+
+→ Conversely, if the conversation explicitly refers to:
+- “credit card”, “debit card”, “member card”, “PAN”, “account number”, “16 หลัก”, “4 หลักสุดท้าย”, “first 4 digits”
+→ Then it is NOT a Thai ID, even if format matches.
+
+🔶 SPECIAL CASE: SPLIT NUMBERS DUE TO SPEECH DISFLUENCIES
+
+> 📌 If a number is split across utterances (e.g., due to “uh”, “wait”, “ok”, pauses, or hesitation) — such as:
+> - “4 digits... uh... 12-13 digits” → likely first 4 + next 12 = 16-digit credit card
+> - “12-13 digits... wait... 4 digits” → likely first 12 + last 4 = 16-digit credit card
+>
+> → ❌ DO NOT classify as Thai ID.
+> → ✅ Only classify as Thai ID if:
+> - The full 12–13 digit sequence stands alone (not part of a longer sequence), AND
+> - The context explicitly asks for 13 digits or Thai ID, OR
+> - The agent confirms it’s 13 digits / points out a missing digit from 13.
+
+> 💡 Example 1 — Split credit card:
+> Caller: “My card is... uh... 4817... then 20010203040506” → total 16 digits → ❌ Not Thai ID.
+>
+> 💡 Example 2 — Thai ID despite “card” wording:
+> Agent: “รบกวนแจ้งเลขบัตรประชาชน 13 หลักครับ”
+> Caller: “Card number... uh... 1207140145732” → ✅ This is Thai ID — context overrides terminology.
+>
+> 💡 Example 3 — Agent confirms missing digit:
+> Caller: “120714014573”
+> Agent: “คุณลูกค้าครับ ขึ้นต้นด้วย 1 แล้วมีแค่ 12 หลัก รบกวนเช็คให้ครบ 13 หลักด้วยครับ” → ✅ Confirmed Thai ID — agent is expecting 13 digits.
+
+→ If ambiguous, default to semantic context over terminology or isolated number format.
+
+→ Record your findings. You will embed them in the context next.
+
+#### C. Write Merged Context (Include Detection Findings)
+
+Combine both contexts into one clear, comprehensive sentence.
+Must include Thai ID detection result if applicable — explain WHY, especially if terminology is misleading or number was split.
+
+Examples:
+- ❌ No Thai ID (split credit card):
+"Caller provides first 4 digits (3912), then pauses, then provides 12-digit sequence — likely part of 16-digit credit card number. Not Thai ID."
+
+- ✅ Thai ID detected despite “card” wording and hesitation:
+"Caller provides 13-digit number (1207140145732) in response to request for 'เลขบัตรประชาชน 13 หลัก' — confirmed as Thai National ID despite hesitation and use of 'card number'."
+
+- ✅ Thai ID confirmed via agent’s “missing digit” prompt:
+"Caller provides 12-digit number; agent responds requesting missing 13th digit — confirms context is Thai National ID. Final number: 1207140145732."
+
+> ✍️ Guidelines:
+> - Preserve all key details.
+> - Use neutral, professional tone.
+> - Do not concatenate — rewrite concisely.
+> - Explicitly mention if Thai ID was detected and why — especially when:
+> - Terminology is ambiguous (“card number”)
+> - Number was split due to hesitation
+> - Agent explicitly asked for 13 digits or noted a missing digit
+> - If split number likely belongs to credit card (4 + 12 or 12 + 4) → explicitly state “likely credit card, not Thai ID”.
+
+#### D. Merge Tags
+- Combine tags from both entries.
+- Remove duplicates.
+- Keep original tag names.
+- Sort alphabetically (optional but preferred).
+
+#### E. Set to_drop Based on Tag Detection
+
+→ If Credit/Payment card is confirmed by semantic context and tag → "to_drop": false
+→ Otherwise → "to_drop": true
+
+#### F. Finalize Time & Speaker — PRESERVE ORIGINAL BOUNDARIES
+
+- start = A.start (must equal B.start within 0.01s — if not, do not merge)
+- end = A.end (must equal B.end within 0.01s — if not, do not merge)
+- speaker must match — if not, do not merge.
+
+> 🚫 Never extend time ranges beyond the matched pair. Do not create “long duration” merged entries by combining non-identical time spans. If timestamps don’t match exactly (within tolerance), treat as separate entries (see Step 4).
+
+#### G. Temporary ID Tracking
+- Keep original IDs for now — reassign in Step 5.
+
+---
+
+### ✅ Step 4: Handle Non-Matching Entries
+
+For any entry in A or B with no match in the other list:
+
+#### A. Apply Thai ID Detection
+- Scan its context + full <conversation> using same rules (Step 3.B), with semantic override.
+
+#### B. Update Context
+- If Thai ID detected → rewrite context to include detection note and resolve terminology ambiguity.
+- If not → leave context as-is or polish for clarity.
+
+#### C. Set to_drop accordingly
+
+#### D. Preserve all other fields — no merging needed.
+
+> ⚠️ Only exclude if truly redundant (same time, speaker, nearly identical context).
+
+---
+
+### ✅ Step 5: Build Final List
+
+1. Collect all processed entries — merged pairs and unmatched singles.
+2. Sort by start time ascending.
+3. Assign new sequential ids starting from 1.
+- First entry → id: 1
+- Second → id: 2, etc.
+4. Ensure no duplicate IDs or gaps.
+
+---
+
+### ✅ Step 6: Output Format Requirements
+
+- Return only the final merged list, as a list of JSON-like array.
+- In the list, each JSON-like object must have (in this order for consistency):
+{
+"id": <integer>,
+"speaker": <string>,
+"context": <string>, // ← Must include Thai ID findings if detected, with semantic clarification
+"tags": [<string>, ...],
+"to_drop": <boolean>,
+"start": <float>,
+"end": <float>
+}
+- Do not include any explanations, comments, or extra text unless asked.
+
+---
+
+### 🚫 What NOT to Do
+- ❌ Do not keep both original entries if they represent the same event.
+- ❌ Do not truncate or lose information from either list.
+- ❌ Do not alter timestamps unless merging (then use union).
+- ❌ Do not invent new tags or contexts not supported by input.
+- ❌ Do not change speaker labels.
+- ❌ Do not set "to_drop": false unless Credit/Payment card is confirmed via semantic conversation context and tag.
+- ❌ Do not drop entries — only flag them. Actual dropping is downstream.
+- ❌ Do not write context before performing Thai ID detection — findings must be included.
+- ❌ Do not rely on surface terms like “card number” — always validate against what was requested and conversation intent.
+
+---
+
+### ✅ Final Checklist Before Output
+
+Before returning the result, confirm:
+- [ ] All entries from A and B are accounted for.
+- [ ] Duplicates are merged, not duplicated.
+- [ ] Thai ID detection performed BEFORE context writing — findings embedded.
+- [ ] to_drop accurately reflects detection result — semantic context overrides terminology.
+- [ ] Time ranges are extended when overlapping.
+- [ ] Tags are combined and deduplicated.
+- [ ] Contexts are informative, rewritten (not concatenated), and include ID findings if any — especially if “card number” was misused.
+- [ ] Final list is sorted by start.
+- [ ] IDs are sequential from 1.
+- [ ] Every entry includes the "to_drop" field.
+- [ ] Output matches required field order and format.
+- [ ] If number was split across utterances, you checked whether it totals 15–16 digits → if yes, ❌ not Thai ID.
+- [ ] If agent or caller explicitly mentioned “13 หลัก” or “missing 1 digit from 13” → ✅ Thai ID confirmed.
+- [ ] Context explains split numbers and why they are or aren’t Thai ID — especially when hesitation or filler words (“uh”, “wait”) caused fragmentation.
+
+---
+
+Now, perform this merge on the following input
+
+<conversation>
+${Transcription}
+</conversation>
+
+<listA>
+${List_alt}
+</listA>
+<listB>
+${List}
+</listB>

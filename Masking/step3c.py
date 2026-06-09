@@ -1,0 +1,1251 @@
+import os
+import re
+import sys
+import argparse
+from collections import defaultdict
+import json
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+from PIL.ImageChops import offset
+from dotenv import load_dotenv
+from jamaibase import JamAI, protocol as p
+from jamaibase.utils.exceptions import ResourceNotFoundError, JamaiException
+
+try:
+  from Masking.logging_utils import LOGGER
+except ImportError:
+  from logging_utils import LOGGER
+
+try:
+  from Masking.jamai_utils import resolve_jamai_timeout
+except ImportError:
+  from jamai_utils import resolve_jamai_timeout
+
+class _Config:
+  def __init__(self, cli: Optional[argparse.Namespace] = None) -> None:
+    # defaults for new flags
+    self.digit_output = "words"  # ascii | thai | words
+    self.map_numwords_to_digits = True
+    self.numeric_start_strategy = "longest"  # longest | earliest
+    self.restart_within_token = True
+    self.include_channel_in_words = False
+
+    # simple mode
+    self.stitch_by_time_only = False
+
+    # cross-talk numeric parsing
+    self.parse_cross_talk_numeric = True
+
+    if cli:
+      self.context_limit = cli.context_limit
+      if cli.digit_output:
+        self.digit_output = cli.digit_output
+      if cli.map_numwords_to_digits is not None:
+        self.map_numwords_to_digits = cli.map_numwords_to_digits
+      if cli.numeric_start_strategy:
+        self.numeric_start_strategy = cli.numeric_start_strategy
+      if cli.restart_within_token is not None:
+        self.restart_within_token = cli.restart_within_token
+      if cli.include_channel_in_words is not None:
+        self.include_channel_in_words = cli.include_channel_in_words
+      if getattr(cli, "stitch_by_time_only", None) is not None:
+        self.stitch_by_time_only = cli.stitch_by_time_only
+      if getattr(cli, "parse_cross_talk_numeric", None) is not None:
+        self.parse_cross_talk_numeric = cli.parse_cross_talk_numeric
+
+# Initialize pipeline logger
+pipeline_logger = LOGGER.bind(type="pipeline", service_name="phase_chunk")
+
+# --- Configuration ---
+load_dotenv()
+CFG = _Config()
+
+# Constants
+PROJECT_ID = os.getenv("PROJECT_ID", "proj_64d9e53a04d6f771ce7438a9")
+# PROJECT_ID = os.getenv("PROJECT_ID", "proj_ebd7046444c656c9cd35dd9c")
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+# JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "https://api.jamaibase.com/api")
+JAMAI_TOKEN = "jamai_pat_9e3570471f1043d064cc1427e4abfdf017084b37d363db29"
+JAMAI_TIMEOUT_SEC = resolve_jamai_timeout(logger=pipeline_logger)
+TABLE_TYPE = p.TableType.ACTION
+INPUT_TABLE_PREFIX = "step3b_"
+OUTPUT_SCHEMA_TABLE_ID = "step3c"
+OUTPUT_TABLE_PREFIX = "step3c_"
+DEFAULT_FETCH_LIMIT = 100
+
+_LOG = LOGGER.bind(type="pipeline", service_name="get_word_timestamps")
+
+def _safe_json(text: str) -> Any:
+  if not text:
+    return None
+  try:
+    return json.loads(text)
+  except Exception as e:
+    _LOG.error(f"Failed to parse JSON: {text}, err: {str(e)}")
+    return None
+
+def extract_reason(timestamp_data, pattern):
+  if not timestamp_data:
+    return ""
+  match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE | re.S)
+  if not match:
+    pipeline_logger.warning("  No Reasoning data")
+    return ""
+  try:
+    reason_str = match.group(1).strip()
+    return reason_str
+  except Exception as e:
+    pipeline_logger.opt(exception=True).error(f"    Unexpected error extracting timestamps: {e}")
+    return []
+
+def extract_timestamps(timestamp_data, pattern):
+  """Extract the JSON array of timestamps from the Combined field."""
+  if not timestamp_data:
+    return []
+  match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE | re.S)  # Case-insensitive tag matching
+  if not match:
+    pipeline_logger.warning("    No Machine_Readable_Output found in timestamp data")
+    return []
+  try:
+    json_str = match.group(1).strip()
+    timestamps = json.loads(json_str)
+    # Validate structure: expect a list of dicts with 'start' and 'end'
+    if not isinstance(timestamps, list):
+      pipeline_logger.error(f"    Parsed timestamp JSON is not a list: {type(timestamps)}")
+      return []
+    valid_timestamps = []
+    for ts in timestamps:
+      if isinstance(ts, dict) and 'start' in ts and 'end' in ts:
+        try:
+          # Ensure start/end are numbers
+          start_s = float(ts['start'])
+          end_s = float(ts['end'])
+          text = ts['text']
+          if start_s < end_s:  # Basic sanity check
+            valid_timestamps.append({'start': start_s, 'end': end_s, 'text': text})
+          else:
+            pipeline_logger.warning(f"    Skipping invalid timestamp range (start >= end): {ts}")
+        except (ValueError, TypeError):
+          pipeline_logger.warning(f"    Skipping timestamp with non-numeric start/end: {ts}")
+      else:
+        pipeline_logger.warning(f"    Skipping invalid timestamp entry format: {ts}")
+    return valid_timestamps
+  except json.JSONDecodeError as e:
+    pipeline_logger.error(f"    Error parsing timestamp JSON: {e}")
+    pipeline_logger.error(f"    Problematic JSON string (first 100 chars): {json_str[:100]}")
+    return []
+  except Exception as e:
+    pipeline_logger.opt(exception=True).error(f"    Unexpected error extracting timestamps: {e}")
+    return []
+  # """Extract the JSON array of timestamps from the Timestamp_to_mask field."""
+  # if not timestamp_data:
+  #   return []
+  # match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE)
+  # if not match:
+  #   _LOG.warning("    No Machine_Readable_Output found in timestamp data")
+  #   return []
+  # json_str = match.group(1).strip()
+  # timestamps = _safe_json(json_str)
+  # return timestamps
+
+
+def parse_timestamp_from_id(table_id: str, prefix: str) -> Optional[str]:
+  """Extracts YYYYMMDD_HHMMSS from table ID if it matches prefix.
+
+  Args:
+      table_id: Full table ID to parse
+      prefix: Expected prefix before timestamp
+
+  Returns:
+      Extracted timestamp string or None if invalid
+  """
+  if table_id.startswith(prefix):
+    timestamp_part = table_id[len(prefix):]
+    try:
+      datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
+      return timestamp_part
+    except ValueError:
+      return None
+  return None
+
+
+def setup_output_table(
+    jamai: JamAI,
+    input_table_timestamp: str,
+    output_schema_table_id: str = OUTPUT_SCHEMA_TABLE_ID
+) -> str:
+  """Sets up the output table by duplicating schema.
+
+  Args:
+      jamai: Initialized JamAI client
+      input_table_timestamp: Timestamp string for output table naming
+      output_schema_table_id: Schema template table ID
+
+  Returns:
+      ID of the created output table
+
+  Raises:
+      JamaiException: If table operations fail
+  """
+  output_table_id = f"{OUTPUT_TABLE_PREFIX}{input_table_timestamp}"
+
+  # Check if output schema exists
+  jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_schema_table_id)
+
+  # Delete existing output table if present
+  try:
+    jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_table_id)
+    jamai.table.delete_table(table_type=TABLE_TYPE, table_id=output_table_id)
+  except ResourceNotFoundError:
+    pass
+
+  # Duplicate schema to new table
+  jamai.table.duplicate_table(
+    table_type=TABLE_TYPE,
+    table_id_src=output_schema_table_id,
+    table_id_dst=output_table_id,
+    include_data=False
+  )
+
+  return output_table_id
+
+
+def _extract_value(field: Any) -> Any:
+  return field.get("value") if isinstance(field, dict) else field
+
+
+def extract_wordsegment_ts(
+    raw_ts: List[Dict[str, Any]],
+    ts_start: float,
+    ts_end: float,
+    start_tolerance: Optional[float] = 60.0,
+    end_tolerance: Optional[float] = None,
+) -> tuple[List[Dict], List[Dict]]:
+  def _overlaps(
+      start: float,
+      end: float,
+      anchor_start: float,
+      anchor_end: float,
+      start_tol: float,
+      end_tol: float,
+  ) -> bool:
+    return (end >= anchor_start - start_tol) and (start <= anchor_end + end_tol)
+
+  kept_words: List[Dict] = []
+  kept_segments: List[Dict] = []
+
+  for seg in raw_ts:
+    if not isinstance(seg, dict):
+      continue
+
+    seg_start = float(seg.get("start", 0.0))
+    seg_end = float(seg.get("end", 0.0))
+    if seg_end < seg_start:
+      seg_start, seg_end = seg_end, seg_start
+
+    duration = seg_end - seg_start
+    default_tol = 10.0 if duration > 15 else 20.0
+    seg_start_tol = default_tol if start_tolerance is None else start_tolerance
+    seg_end_tol = default_tol if end_tolerance is None else end_tolerance
+
+    if not _overlaps(seg_start, seg_end, ts_start, ts_end, seg_start_tol, seg_end_tol):
+      continue
+
+    channel = seg.get("channel")
+    words_in_segment: List[Dict] = []
+
+    for word in seg.get("words", []):
+      if not isinstance(word, dict):
+        continue
+
+      text = str(word.get("word", ""))
+      if not text.strip():
+        continue
+
+      enriched = dict(word)
+      enriched["channel"] = channel
+      words_in_segment.append(enriched)
+
+    kept_words.extend(words_in_segment)
+    kept_segments.append(
+      {
+        "start": seg_start,
+        "end": seg_end,
+        "text": seg.get("text", ""),
+        "channel": channel,
+      }
+    )
+
+  return [item for item in kept_words], kept_segments
+
+
+def extract_word_ts(
+    wordsegment_ts: List[Dict[str, Any]],
+    ts_start: float,
+    ts_end: float,
+    start_tolerance: float = 8.0,
+    end_tolerance: float = 8.0,
+) -> List[Dict]:
+  def _overlaps(
+      s: float,
+      e: float,
+      a: float,
+      b: float,
+      start_tol: float,
+      end_tol: float,
+  ) -> bool:
+    return (e >= a - start_tol) and (s <= b + end_tol)
+
+  # Keep zero-duration tokens (e == s) because Thai combining marks may be isolated.
+  kept = [
+    w for w in wordsegment_ts
+    if isinstance(w, dict)
+       and _overlaps(
+      float(w["start"]),
+      float(w["end"]),
+      ts_start,
+      ts_end,
+      start_tolerance,
+      end_tolerance,
+    )
+       and str(w.get("word", "")).strip()
+       and float(w["end"]) >= float(w["start"])  # allow zero-duration marks
+  ]
+  # stable order
+  kept.sort(key=lambda w: (float(w["start"]), float(w["end"]), w.get("channel")))
+
+  unique: List[Dict] = []
+  seen_spans = set()
+  for w in kept:
+    start = float(w["start"])
+    end = float(w["end"])
+    channel = w.get("channel")
+    text = str(w.get("word", ""))
+    key = (start, end, channel, text)
+    if key in seen_spans:
+      continue
+    seen_spans.add(key)
+    unique.append({"start": start, "end": end, "word": text, "channel": channel})
+  return unique
+
+def format_word_segments(segments: List, key: str = "word", with_channel: bool = False) -> List:
+  lines = []
+  for seg in segments:
+    start = f"{seg['start']:.2f}".rstrip('0').rstrip('.')
+    end = f"{seg['end']:.2f}".rstrip('0').rstrip('.')
+    text = str(seg[key]).strip()
+    if not text:
+      continue
+    if with_channel and (seg.get("channel") is not None):
+      lines.append(f"<{start}:{end}|{seg['channel']}> {text}")
+    else:
+      lines.append(f"<{start}:{end}> {text}")
+  return lines
+
+def stitch_by_time(
+    words: List[Dict],
+    gap: float = 3.0,  # default 3 seconds
+    max_chars: int = 4096,
+    max_dur: float = 3600.0,
+    disallow_cross_channel_merge: bool = True,
+) -> List[Dict]:
+  out: List[Dict] = []
+  cur: Optional[Dict] = None
+  for t in sorted(words, key=lambda x: (x["start"], x["end"])):
+    if cur is None:
+      cur = dict(t)
+      continue
+    if disallow_cross_channel_merge and t.get("channel") != cur.get("channel"):
+      out.append(cur)
+      cur = dict(t)
+      continue
+    time_gap = t["start"] - cur["end"]
+    merged_dur = t["end"] - cur["start"]
+    merged_text = str(cur.get("word", "")) + str(t.get("word", ""))
+    if time_gap <= gap and merged_dur <= max_dur and len(merged_text) <= max_chars:
+      cur["end"] = t["end"]
+      cur["word"] = merged_text
+    else:
+      out.append(cur)
+      cur = dict(t)
+  if cur: out.append(cur)
+  return out
+
+def stitch_thai_numeral_words(words: List[Dict], word_stitch_gap: float = 0.6) -> List[Dict]:
+  THAI_NUMS = {"ศูนย์", "หนึ่ง", "เอ็ด", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า"}
+  prefixes = {p for w in THAI_NUMS for i in range(1, len(w) + 1) for p in [w[:i]]}
+
+  def starts_with_numeral(s: str) -> bool:
+    return any(s.startswith(w) for w in THAI_NUMS)
+
+  out: List[Dict] = []
+  buf = "";
+  buf_start = buf_end = None;
+  buf_chan = None
+  words = sorted(words, key=lambda x: (x["start"], x["end"]))
+
+  def flush():
+    nonlocal buf, buf_start, buf_end, buf_chan
+    if buf:
+      out.append({"start": buf_start, "end": buf_end, "word": buf, "channel": buf_chan})
+      buf = "";
+      buf_start = buf_end = None;
+      buf_chan = None
+
+  for t in words:
+    w = (t.get("word") or "").strip()
+    if not w:
+      out.append(t);
+      continue
+
+    if not buf:
+      if w in prefixes:
+        buf, buf_start, buf_end, buf_chan = w, t["start"], t["end"], t.get("channel")
+      else:
+        out.append(t)
+      continue
+
+    if t.get("channel") != buf_chan or t["start"] - buf_end > word_stitch_gap:
+      flush()
+      if w in prefixes:
+        buf, buf_start, buf_end, buf_chan = w, t["start"], t["end"], t.get("channel")
+      else:
+        out.append(t)
+      continue
+
+    cand = buf + w
+    if cand in prefixes:
+      buf, buf_end = cand, max(buf_end, t["end"])
+      if cand in THAI_NUMS:
+        out.append({"start": buf_start, "end": buf_end, "word": cand, "channel": buf_chan})
+        buf = "";
+        buf_start = buf_end = None;
+        buf_chan = None
+      continue
+    if starts_with_numeral(cand):
+      out.append({"start": buf_start, "end": max(buf_end, t["end"]), "word": cand, "channel": buf_chan})
+      buf = "";
+      buf_start = buf_end = None;
+      buf_chan = None
+      continue
+
+    flush()
+    if w in prefixes:
+      buf, buf_start, buf_end, buf_chan = w, t["start"], t["end"], t.get("channel")
+    else:
+      out.append(t)
+
+  flush()
+  return out
+
+def stitch_thai_text(words: List[Dict], gap: float = 0.30, max_chars: int = 64, max_dur: float = 2.5) -> List[Dict]:
+  THAI_RANGE = range(0x0E00, 0x0E7F + 1)
+
+  def _thai_only(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+      return False
+    return all(ord(ch) in THAI_RANGE or ch.isspace() for ch in s)
+
+  out: List[Dict] = []
+  buf: Optional[Dict] = None
+  for t in sorted(words, key=lambda x: (x["start"], x["end"])):
+    w = str(t.get("word", ""))
+    if _thai_only(w):
+      if buf:
+        gap_ok = t["start"] - buf["end"] <= gap
+        dur_ok = t["end"] - buf["start"] <= max_dur
+        len_ok = len(buf["word"] + w) <= max_chars
+        same_chan = (t.get("channel") == buf.get("channel"))
+        if gap_ok and dur_ok and len_ok and same_chan:
+          buf["end"] = t["end"]
+          buf["word"] += w
+          continue
+        out.append(buf);
+        buf = dict(t)
+      else:
+        buf = dict(t)
+    else:
+      if buf: out.append(buf); buf = None
+      out.append(t)
+  if buf: out.append(buf)
+  return out
+
+
+def compress_word_timestamps(
+    data,
+    # ---- normal text merging (conservative) ----
+    time_threshold: float = 0.1,
+    max_duration: float = 1.0,
+    max_chars: int = 15,
+    *,
+    # ---- numeric controls (Thai digits + Thai number words) ----
+    digit_ratio: float = 0.85,
+    numeric_time_gap: float = 1.0,
+    numeric_max_duration: float = 12.0,
+    numeric_max_digits: int = 38,
+    # ---- bridging across filler words only ----
+    bridge_any_token: bool = True,
+    bridge_max_tokens: int = 3,
+    bridge_max_total_gap: float = 1.0,
+    bridge_keep_text: bool = True,
+    keep_preface_text: bool = False,  # avoid duplicate when entering numeric within same token
+    # ---- digit normalization ----
+    normalize_to_ascii: bool = True,
+    map_numwords_to_digits: bool = True,
+    # ---- channel safety ----
+    disallow_cross_channel_merge: bool = True,
+    numeric_parse_cross_talk: bool = False,  # NEW: parse cross-talk token into its own numeric line
+    # ---- early stop for PAN-like runs ----
+    early_stop_digits_primary: int = 16,
+    early_stop_digits_alt: int = 15,
+    # ---- post-pass controls ----
+    drop_prefix_neighbors: bool = False,
+    prefix_neighbor_max_gap: float = 0.20,
+    prefix_neighbor_allow_interleaving: int = 2,
+    # ---- start strategy & restarts ----
+    numeric_start_strategy: str = "longest",  # "longest" | "earliest"
+    restart_within_token: bool = True,
+    # ---- rendering ----
+    digit_output: str = "ascii",  # "ascii" | "thai" | "words"
+    include_channel_in_output: bool = True,
+):
+  """
+  Thai-aware, channel-aware compressor:
+    • merges Unicode digits and Thai number words into contiguous runs with a prefix buffer
+    • avoids digitizing count phrases (“สามตัว/สองหลัก/หมายเลข…”)
+    • bridges across *filler* tokens only; does NOT bridge across definitional words
+    • optionally keeps bridged tokens as text lines (filters micro debris)
+    • blocks merges across speaker changes (but does not kill ongoing numeric runs due to cross-talk)
+    • early-stops once a PAN-like length (16 or 15) is reached
+    • optional post-pass drops short numeric prefixes if a longer continuation starts almost immediately after
+    • NEW (2025-09-19): "longest" start + restart-within-token; robust filler normalization; rendering (ascii/thai/words)
+    • NEW (2025-09-21): `keep_preface_text` to prevent duplicate lines, simple time-stitch mode,
+                         and `numeric_parse_cross_talk` to parse cross-talk into its own numeric line.
+  """
+  import unicodedata as U
+
+  if not data:
+    return []
+
+  EPS = 1e-9
+
+  # --- Unicode normalization helper ---
+  def _nfc(s: str) -> str:
+    try:
+      return U.normalize("NFC", s or "")
+    except Exception:
+      return s or ""
+
+  # Thai number-word mapping (normalized to NFC)
+  WORD2DIG_RAW = [
+    ("ศูนย์", "0"),
+    ("หนึ่ง", "1"), ("เอ็ด", "1"),
+    ("สอง", "2"),
+    ("สาม", "3"),
+    ("สี่", "4"),
+    ("ห้า", "5"),
+    ("หก", "6"),
+    ("เจ็ด", "7"),
+    ("แปด", "8"),
+    ("เก้า", "9"),
+  ]
+  WORD2DIG = [(_nfc(w), d) for (w, d) in WORD2DIG_RAW]
+  WORD2DIG.sort(key=lambda kv: len(kv[0]), reverse=True)
+  WORDS = [w for w, _ in WORD2DIG]
+  MAX_WORD_LEN = max(len(w) for w in WORDS)
+
+  # Classifiers & link words (avoid count phrases, skip definition links)
+  CLASSIFIERS = tuple(_nfc(x) for x in ("ตัว", "หลัก", "หมายเลข", "เลข", "ตำแหน่ง", "ชุด"))
+  LINK_WORDS = tuple(_nfc(x) for x in ("คือ", "ก็คือ", "เป็น", "ได้แก่", "หมายถึง"))
+  SINGLE_PREFIX_OK = set(w[0] for w in WORDS) | {"เ", "แ"}
+
+  # Filler words (normalized)
+  FILLERS = tuple(_nfc(x) for x in (
+    "ครับ", "ค่ะ", "คะ", "ฮะ", "นะ", "จ้า", "จ๊ะ", "หน่อย",
+    "เอ่อ", "เอิ่", "อ่า", "อืม", "โอเค", "ครับผม", "ค่ะค่ะ",
+    "ok", "okay", "uh", "um", "erm", "wait", "hmm"
+  ))
+  FILLERS_SET = set(FILLERS)
+
+  PUNCT = set("-–—_.,/:|!?\"'()[]{};")
+
+  def _is_micro_noise(raw: str) -> bool:
+    s = (raw or "").strip()
+    return len(s) <= 2 and not any(ch.isdigit() for ch in s)
+
+  # ---------- helpers ----------
+  def _strip_noise(s: str) -> str:
+    if not s:
+      return ""
+    # Remove spaces, zero-width, punct; lowercase then NFC
+    s2 = (s.replace(" ", "").replace("\u200b", ""))
+    for ch in PUNCT:
+      s2 = s2.replace(ch, "")
+    low = _nfc(s2.lower())
+    for f in FILLERS:
+      low = low.replace(f, "")
+    return _nfc(low)
+
+  def _norm_digit_char(ch: str) -> str:
+    if not ch.isdigit():
+      return ""
+    if not normalize_to_ascii:
+      return ch
+    try:
+      return str(U.digit(ch))
+    except Exception:
+      return ""
+
+  def _allow_direct_digits_in_token(clean_token: str) -> bool:
+    alnum = sum(1 for c in clean_token if c.isalnum())
+    if alnum == 0:
+      return False
+    dchars = sum(1 for c in clean_token if c.isdigit())
+    return (dchars / alnum) >= digit_ratio
+
+  def _starts_with_numword(s: str, i: int) -> str | None:
+    if not map_numwords_to_digits:
+      return None
+    for w, _ in WORD2DIG:
+      if s.startswith(w, i):
+        return w
+    return None
+
+  def _follows_classifier(s: str, j: int) -> bool:
+    tail = s[j:].lstrip()
+    return any(tail.startswith(cf) for cf in CLASSIFIERS)
+
+  def _consume_from_start(s: str, allow_direct_digits: bool) -> tuple[str, str, List[str]]:
+    """Return (digits, leftover, words_used). words_used is a list of Thai numeral words consumed."""
+    out = []
+    words_used: List[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+      matched = False
+      w = _starts_with_numword(s, i)
+      if w:
+        words_used.append(s[i:i + len(w)])
+        d = next((d for ww, d in WORD2DIG if ww == w), "")
+        if d:
+          out.append(d)
+        i += len(w)
+        matched = True
+      if matched:
+        continue
+      ch = s[i]
+      if ch.isdigit() and allow_direct_digits:
+        d = _norm_digit_char(ch)
+        if d:
+          out.append(d);
+          i += 1
+          continue
+      break
+    return "".join(out), s[i:], words_used
+
+  def _all_numeric_starts(clean: str, allow_direct: bool) -> List[int]:
+    idxs = set()
+    if allow_direct:
+      for i, ch in enumerate(clean):
+        if ch.isdigit():
+          idxs.add(i)
+    if map_numwords_to_digits:
+      for i in range(len(clean)):
+        w = _starts_with_numword(clean, i)
+        if w:
+          j = i + len(w)
+          if _follows_classifier(clean, j):
+            continue
+          idxs.add(i)
+    return sorted(idxs)
+
+  def _best_numeric_start(clean: str, allow_direct: bool) -> int | None:
+    idxs = _all_numeric_starts(clean, allow_direct)
+    if not idxs:
+      return None
+    if numeric_start_strategy == "earliest":
+      return idxs[0]
+    # longest: choose the start that yields the longest immediate consume
+    best_idx, best_len = idxs[0], -1
+    for i in idxs:
+      d, _, _ = _consume_from_start(clean[i:], allow_direct_digits=True)
+      if len(d) > best_len or (len(d) == best_len and i < best_idx):
+        best_idx, best_len = i, len(d)
+    return best_idx
+
+  def _longest_suffix_prefix(s: str) -> str:
+    maxk = min(len(s), MAX_WORD_LEN)
+    for k in range(maxk, 0, -1):
+      suf = s[-k:]
+      if any(w.startswith(suf) for w in WORDS):
+        if k == 1 and suf not in SINGLE_PREFIX_OK:
+          continue
+        return suf
+    return ""
+
+  # --- rendering helpers ---
+  THAI_DIGIT_TRANS = str.maketrans("0123456789", "๐๑๒๓๔๕๖๗๘๙")
+
+  DIG2WORD = {
+    "0": "ศูนย์", "1": "หนึ่ง", "2": "สอง", "3": "สาม", "4": "สี่", "5": "ห้า", "6": "หก", "7": "เจ็ด", "8": "แปด",
+    "9": "เก้า"
+  }
+
+  def _render_digits(digits: str, words_glued: str) -> str:
+    if digit_output == "ascii":
+      return digits
+    if digit_output == "thai":
+      return digits.translate(THAI_DIGIT_TRANS)
+    # words: prefer glued Thai words if any; otherwise map digits -> words
+    if words_glued:
+      return words_glued
+    return "".join(DIG2WORD.get(ch, ch) for ch in digits)
+
+  # ---------- prepare input ----------
+  items = []
+  for idx, w in enumerate(data):
+    try:
+      s = float(w["start"]);
+      e = float(w["end"]);
+      t = str(w.get("word", ""))
+    except Exception:
+      continue
+    if e < s:
+      s, e = e, s
+    items.append({"start": s, "end": e, "word": t, "_i": idx, "channel": w.get("channel")})
+  items.sort(key=lambda x: (x["start"], x["end"], x["_i"]))
+
+  # ---------- main FSM ----------
+  out: List[Dict] = []
+  mode = None  # None | "text" | "numeric"
+  current: Optional[Dict] = None
+  bridged_tokens = 0
+  bridged_time = 0.0
+  buf = ""  # prefix buffer for Thai number words
+  curr_channel = None
+
+  def _flush(cur: Optional[Dict]):
+    if cur and cur.get("word"):
+      if out and abs(out[-1]["start"] - cur["start"]) < EPS and \
+          abs(out[-1]["end"] - cur["end"]) < EPS and \
+          out[-1]["word"] == cur["word"] and \
+          out[-1].get("channel") == cur.get("channel"):
+        return
+      out.append(cur)
+
+  for tok in items:
+    t0, t1, raw, chan = tok["start"], tok["end"], tok["word"], tok.get("channel")
+    clean = _strip_noise(raw)
+
+    # --- channel barrier: tolerant during numeric runs (cross-talk) ---
+    if disallow_cross_channel_merge and curr_channel is not None and chan != curr_channel:
+      if mode == "numeric":
+        handled = False
+        if numeric_parse_cross_talk:
+          # Parse cross-talk token into its own numeric line (do not affect main run)
+          allow_direct_xt = _allow_direct_digits_in_token(clean)
+          pos_xt = _best_numeric_start(clean, allow_direct_xt)
+          if pos_xt is not None:
+            dxt, rem_xt, wxt = _consume_from_start(clean[pos_xt:], allow_direct_digits=True)
+            if restart_within_token:
+              rem = rem_xt
+              while True:
+                pos2 = _best_numeric_start(rem, allow_direct=True)
+                if pos2 is None:
+                  break
+                d2, rem2, w2 = _consume_from_start(rem[pos2:], allow_direct_digits=True)
+                if not d2:
+                  break
+                dxt += d2
+                wxt += w2
+                rem = rem2
+            emit_xt = _render_digits(dxt, "".join(wxt))
+            if emit_xt:
+              xt = {"start": t0, "end": t1, "word": emit_xt}
+              if include_channel_in_output:
+                xt["channel"] = chan
+              out.append(xt)
+              handled = True
+        if not handled:
+          if raw.strip():
+            out.append({"start": t0, "end": t1, "word": raw, "channel": chan if include_channel_in_output else None})
+        # Keep the main numeric run alive; do not switch channel.
+        continue
+      # For text mode, conservative behavior.
+      _flush(current)
+      current = None;
+      mode = None;
+      buf = ""
+      bridged_tokens = bridged_time = 0.0
+      curr_channel = chan  # switch to new channel
+
+    # ---- enter numeric mode?
+    if mode != "numeric":
+      allow_direct = _allow_direct_digits_in_token(clean)
+      pos = _best_numeric_start(clean, allow_direct)
+      if pos is not None:
+        if pos > 0 and raw.strip() and keep_preface_text and not _is_micro_noise(raw):
+          out.append({"start": t0, "end": t1, "word": raw, "channel": chan if include_channel_in_output else None})
+        digits, leftover, words_used = _consume_from_start(clean[pos:], allow_direct_digits=True)
+        words_glued = "".join(words_used) if words_used else ""
+        if current and mode == "text":
+          _flush(current)
+        emit_text = _render_digits(digits, words_glued)
+        current = {"start": t0, "end": t1, "word": emit_text, "_digits": digits, "_words": words_glued}
+        if include_channel_in_output:
+          current["channel"] = chan
+        mode = "numeric"
+        curr_channel = chan
+        bridged_tokens = bridged_time = 0.0
+        buf = _longest_suffix_prefix(leftover)
+        if restart_within_token:
+          rem = leftover
+          while True:
+            pos2 = _best_numeric_start(rem, allow_direct=True)
+            if pos2 is None:
+              break
+            d2, rem2, words_used2 = _consume_from_start(rem[pos2:], allow_direct_digits=True)
+            if not d2:
+              break
+            new_digits = current["_digits"] + d2
+            if len(new_digits) > numeric_max_digits:
+              break
+            current["_digits"] = new_digits
+            current["_words"] = current["_words"] + "".join(words_used2)
+            current["word"] = _render_digits(current["_digits"], current["_words"])
+            buf = _longest_suffix_prefix(rem2)
+            rem = rem2
+        continue
+
+    # ---- numeric continuation
+    if mode == "numeric":
+      combined = (buf + clean) if buf else clean
+      digits, leftover, words_used = _consume_from_start(combined, allow_direct_digits=True)
+      if digits:
+        time_gap = t0 - current["end"]
+        merged_duration = t1 - current["start"]
+        if time_gap <= numeric_time_gap and merged_duration <= numeric_max_duration:
+          current["end"] = t1
+          if len(current["_digits"]) + len(digits) > numeric_max_digits:
+            out_word = dict(current)
+            out_word.pop("_digits", None);
+            out_word.pop("_words", None)
+            _flush(out_word)
+            emit_text = _render_digits(digits, "".join(words_used))
+            current = {"start": t0, "end": t1, "word": emit_text, "_digits": digits, "_words": "".join(words_used)}
+            if include_channel_in_output:
+              current["channel"] = chan
+          else:
+            current["_digits"] += digits
+            current["_words"] += "".join(words_used)
+            current["word"] = _render_digits(current["_digits"], current["_words"])
+          curr_channel = chan
+          bridged_tokens = 0;
+          bridged_time = 0.0
+          buf = _longest_suffix_prefix(leftover)
+          if restart_within_token:
+            rem = leftover
+            while True:
+              pos2 = _best_numeric_start(rem, allow_direct=True)
+              if pos2 is None:
+                break
+              d2, rem2, words_used2 = _consume_from_start(rem[pos2:], allow_direct_digits=True)
+              if not d2:
+                break
+              if len(current["_digits"]) + len(d2) > numeric_max_digits:
+                break
+              current["_digits"] += d2
+              current["_words"] += "".join(words_used2)
+              current["word"] = _render_digits(current["_digits"], current["_words"])
+              buf = _longest_suffix_prefix(rem2)
+              rem = rem2
+          continue
+        else:
+          out_word = dict(current)
+          out_word.pop("_digits", None);
+          out_word.pop("_words", None)
+          _flush(out_word)
+          emit_text = _render_digits(digits, "".join(words_used))
+          current = {"start": t0, "end": t1, "word": emit_text, "_digits": digits, "_words": "".join(words_used)}
+          if include_channel_in_output:
+            current["channel"] = chan
+          curr_channel = chan
+          bridged_tokens = 0;
+          bridged_time = 0.0
+          buf = _longest_suffix_prefix(leftover)
+          if restart_within_token:
+            rem = leftover
+            while True:
+              pos2 = _best_numeric_start(rem, allow_direct=True)
+              if pos2 is None:
+                break
+              d2, rem2, words_used2 = _consume_from_start(rem[pos2:], allow_direct_digits=True)
+              if not d2:
+                break
+              if len(current["_digits"]) + len(d2) > numeric_max_digits:
+                break
+              current["_digits"] += d2
+              current["_words"] += "".join(words_used2)
+              current["word"] = _render_digits(current["_digits"], current["_words"])
+              buf = _longest_suffix_prefix(rem2)
+              rem = rem2
+          continue
+
+      # no digits at start of (buf+clean): consider early stop then bridging
+      norm_raw = _nfc(str(raw or "")).strip()
+      tok_is_filler = (norm_raw in FILLERS_SET) or (_strip_noise(norm_raw) in FILLERS_SET)
+      if (len(current["_digits"]) >= early_stop_digits_primary or
+          len(current["_digits"]) >= early_stop_digits_alt) and not tok_is_filler:
+        out_word = dict(current)
+        out_word.pop("_digits", None);
+        out_word.pop("_words", None)
+        _flush(out_word)
+        current = None;
+        mode = None;
+        buf = ""
+        bridged_tokens = bridged_time = 0.0
+      else:
+        if bridge_any_token and tok_is_filler and not any(kw in clean for kw in LINK_WORDS):
+          token_gap = t0 - (current["end"])
+          token_dur = t1 - t0
+          merged_duration = t1 - current["start"]
+          if (token_gap <= numeric_time_gap and
+              bridged_tokens + 1 <= bridge_max_tokens and
+              bridged_time + token_dur <= bridge_max_total_gap and
+              merged_duration <= numeric_max_duration):
+            if bridge_keep_text and raw.strip() and not _is_micro_noise(raw):
+              out.append({"start": t0, "end": t1, "word": raw, "channel": chan if include_channel_in_output else None})
+            current["end"] = t1
+            bridged_tokens += 1;
+            bridged_time += token_dur
+            buf = _longest_suffix_prefix((buf + clean) if buf else clean)
+            curr_channel = chan
+            continue
+
+        out_word = dict(current)
+        out_word.pop("_digits", None);
+        out_word.pop("_words", None)
+        _flush(out_word)
+        current = None;
+        mode = None;
+        buf = ""
+        bridged_tokens = bridged_time = 0.0
+        curr_channel = chan
+
+    # ---- text path
+    if current is None or mode != "text":
+      current = {"start": t0, "end": t1, "word": raw}
+      if include_channel_in_output:
+        current["channel"] = chan
+      mode = "text";
+      curr_channel = chan
+    else:
+      merged_word = current["word"] + raw
+      merged_duration_text = t1 - current["start"]
+      time_gap_text = t0 - current["end"]
+      can_merge_text = (
+          not current["word"].endswith(" ")
+          and not raw.startswith(" ")
+          and time_gap_text <= time_threshold
+          and merged_duration_text <= max_duration
+          and len(merged_word) <= max_chars
+          and not (disallow_cross_channel_merge and chan != curr_channel)
+      )
+      if can_merge_text:
+        current["end"] = t1
+        current["word"] = merged_word
+      else:
+        _flush(current)
+        current = {"start": t0, "end": t1, "word": raw}
+        if include_channel_in_output:
+          current["channel"] = chan
+        curr_channel = chan
+
+  # flush tail
+  if current:
+    out_word = dict(current)
+    out_word.pop("_digits", None);
+    out_word.pop("_words", None)
+    _flush(out_word)
+
+  out.sort(key=lambda x: (x["start"], x["end"]))
+
+  # ---------- post-pass: drop prefix numeric neighbors (optional) ----------
+  if drop_prefix_neighbors and out:
+    def _drop_prefix_neighbors(tokens: List[Dict], max_gap: float, allow_interleaving: int) -> List[Dict]:
+      result: List[Dict] = []
+      i = 0
+      n = len(tokens)
+      THAI2ASCII = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+      while i < n:
+        cur = tokens[i]
+        wcur = str(cur["word"])
+        cur_ascii = wcur.translate(THAI2ASCII)
+        cur_is_num = cur_ascii.isdigit()
+        if not cur_is_num:
+          result.append(cur);
+          i += 1;
+          continue
+        j = i + 1
+        inter = 0
+        drop_cur = False
+        while j < n and tokens[j]["start"] - cur["end"] <= max_gap:
+          wj = str(tokens[j]["word"])
+          wj_ascii = wj.translate(THAI2ASCII)
+          if wj_ascii.isdigit():
+            if wj_ascii.startswith(cur_ascii) and len(wj_ascii) > len(cur_ascii):
+              drop_cur = True
+              break
+            else:
+              break
+          else:
+            inter += 1
+            if inter > allow_interleaving:
+              break
+          j += 1
+        if not drop_cur:
+          result.append(cur)
+        i += 1
+      return result
+
+    out = _drop_prefix_neighbors(out, prefix_neighbor_max_gap, prefix_neighbor_allow_interleaving)
+
+  return out
+
+def _process_row(
+    list_ts_to_mask: List[Dict[str, Any]],
+    input_ts: List[Dict[str, Any]],
+):
+  match_ts = []
+  match_ws_ts = []
+  for ts_to_mask in list_ts_to_mask:
+    ts_start = ts_to_mask["start"]
+    ts_end = ts_to_mask["end"]
+    _wordsegment_ts_raw, _segment_ts_raw = extract_wordsegment_ts(input_ts, ts_start, ts_end)
+    _word_ts = extract_word_ts(_wordsegment_ts_raw, ts_start, ts_end)
+    if CFG.stitch_by_time_only:
+      _compressed_word_ts = stitch_by_time(
+        _word_ts, gap=3.0, max_chars=4096, max_dur=3600.0, disallow_cross_channel_merge=True
+      )
+    else:
+      _word_ts = stitch_thai_numeral_words(_word_ts, word_stitch_gap=0.6)
+      _word_ts = stitch_thai_text(_word_ts, gap=0.30, max_chars=64, max_dur=2.5)
+      _compressed_word_ts = compress_word_timestamps(
+        _word_ts,
+        numeric_time_gap=1.0,
+        bridge_max_total_gap=1.0,
+        bridge_max_tokens=3,
+        bridge_keep_text=True,
+        keep_preface_text=False,
+        normalize_to_ascii=False,
+        map_numwords_to_digits=CFG.map_numwords_to_digits,
+        disallow_cross_channel_merge=True,
+        numeric_parse_cross_talk=CFG.parse_cross_talk_numeric,
+        early_stop_digits_primary=16,
+        early_stop_digits_alt=15,
+        drop_prefix_neighbors=False,
+        numeric_start_strategy=CFG.numeric_start_strategy,
+        restart_within_token=CFG.restart_within_token,
+        digit_output=CFG.digit_output,
+        include_channel_in_output=CFG.include_channel_in_words,
+      )
+    _formatted_segments_ts = format_word_segments(_segment_ts_raw, "text",
+                                                          with_channel=CFG.include_channel_in_words)
+    _formatted_word_ts = format_word_segments(_compressed_word_ts, with_channel=CFG.include_channel_in_words)
+    match_ws_ts.append("\n".join(_formatted_segments_ts))
+    match_ts.append("\n".join(_formatted_word_ts))
+  return zip(list_ts_to_mask, match_ws_ts, match_ts, strict=True)
+
+def retrieve_ts_to_mask(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+  # preferred List_final over Timestamp_to_mask
+  # use Timestamp_to_mask if List_final failed to parse
+  ts_recheck = _extract_value(row.get("Timestamp_recheck"))
+  list_ts_recheck = extract_timestamps(ts_recheck, pattern=r'<Machine_Readable_Output>\s*(.*?)\s*</Machine_Readable_Output>')
+  result = []
+  for t in list_ts_recheck:
+    result.append(t)
+  return result
+
+def get_data_from_input_table(jamai: JamAI, input_table_timestamp: str) -> List[Dict[str, Any]]:
+  """Sets up the output table by duplicating schema.
+
+  Args:
+      jamai: Initialized JamAI client
+      input_table_timestamp: Timestamp string for output table naming
+
+  Returns:
+      Input table data
+
+  Raises:
+      JamaiException: If table operations fail
+  """
+  INPUT_TABLE_ID = f"{INPUT_TABLE_PREFIX}{input_table_timestamp}"
+  INPUT_TABLE_STEP1 = f"step1_{input_table_timestamp}"
+
+  # Delete existing output table if present
+  try:
+    input_table = jamai.table.get_table(table_type=TABLE_TYPE, table_id=INPUT_TABLE_ID)
+    step1_table = jamai.table.get_table(table_type=p.TableType.ACTION, table_id=INPUT_TABLE_STEP1)
+  except ResourceNotFoundError:
+    pipeline_logger.error(f"Input table '{INPUT_TABLE_ID}' not found.")
+    pass
+
+  total_rows = input_table.num_rows
+  total_rows_step1 = step1_table.num_rows
+  offset = 0
+  _row_num = 0
+  all_rows: list[dict[str, Any]] = []
+  while _row_num < total_rows:
+    limit = DEFAULT_FETCH_LIMIT
+    try:
+      rows = jamai.table.list_table_rows(
+        table_type=TABLE_TYPE,
+        table_id=input_table.id,
+        columns=["file_path", "Segment_ID", "Transcription", "SegmentsAndWords", "WordTimeStamp", "Combined",
+                 "Timestamp_recheck", "Timestamp_to_mask"],
+        limit=limit,
+        offset=offset
+      )
+      offset += limit
+      _row_num += len(rows.items)
+      all_rows.extend(rows.items)
+    except JamaiException as e:
+      if e.status_code == 404:
+        break
+      raise
+  offset = 0
+  _row_num = 0
+  input_rows: list[dict[str, Any]] = []
+  while _row_num < total_rows_step1:
+    limit = DEFAULT_FETCH_LIMIT
+    step1_rows = jamai.table.list_table_rows(
+      table_type=p.TableType.ACTION,
+      table_id=INPUT_TABLE_STEP1,
+      columns=[
+        "file_path",
+        "SegmentsAndWords",
+      ],
+      limit=limit,
+      offset=offset
+    )
+    offset += limit
+    _row_num += len(step1_rows.items)
+    input_rows.extend(step1_rows.items)
+  payloads = []
+  for r in all_rows:
+    list_ts_to_mask = retrieve_ts_to_mask(r)
+    print(list_ts_to_mask)
+    if len(list_ts_to_mask) == 0:
+      _LOG.info(f"No PAN to mask for file: {_extract_value(r.get('file_path'))}")
+      continue
+    input_chunks = [i for i in input_rows if _extract_value(i.get("file_path")) == _extract_value(r.get("file_path"))]
+    raw_input_ts = _safe_json(_extract_value(input_chunks[0].get("SegmentsAndWords")))
+    matched_mask_with_ts = _process_row(list_ts_to_mask=list_ts_to_mask, input_ts=raw_input_ts)
+    combined = _extract_value(r.get("Combined"))
+    for ts_to_recheck, matched_ws_ts, matched_word_ts in matched_mask_with_ts:
+      reason = extract_reason(_extract_value(r.get("Timestamp_recheck")), pattern=r'<Reasoning>\s*(.*?)\s*</Reasoning>')
+      content_timestamp_recheck = f"<Reasoning>\n{reason}\n</Reasoning>\n<Machine_Readable_Output>\n{json.dumps(ts_to_recheck, ensure_ascii=False)}\n</Machine_Readable_Output>"
+      obj = {
+            "file_path": _extract_value(r.get("file_path")),
+            "Segment_ID": _extract_value(r.get("Segment_ID")),
+            "Transcription": _extract_value(r.get("Transcription")),
+            "SegmentsAndWords": matched_ws_ts,
+            "WordTimeStamp": matched_word_ts,
+            "Combined": combined,
+            "Timestamp_recheck": content_timestamp_recheck
+        }
+      payloads.append(obj)
+  return payloads
+
+
+def add_rows_to_output_table(jamai: JamAI, output_table_id: str, rows: List[Dict[str, Any]]):
+  """Add rows to the output table.
+
+  Args:
+      jamai: Initialized JamAI client
+      output_table_id: Output table ID
+      rows: Rows to add to the output table
+  """
+  batch_size = 100
+
+  if len(rows) <= batch_size:
+    jamai.table.add_table_rows(
+      table_type=TABLE_TYPE,
+      request=p.RowAddRequest(
+        table_id=output_table_id,
+        data=rows,
+        stream=False,
+      )
+    )
+  else:
+    for i in range(0, len(rows), batch_size):
+      batch = rows[i:i + batch_size]
+      jamai.table.add_table_rows(
+        table_type=TABLE_TYPE,
+        request=p.RowAddRequest(
+          table_id=output_table_id,
+          data=batch,
+          stream=False,
+        )
+      )
+
+
+def run_step(
+    input_table_id_step1: Optional[str] = None,
+    input_table_id_step3b: Optional[str] = None
+) -> str:
+  """Main function to process input table and create output table.
+
+  Args:
+      input_table_id: Explicit table ID or None to auto-detect latest
+      context_limit: Token limit for each segment chunk
+
+  Returns:
+      ID of the created output table
+
+  Raises:
+      JamaiException: For JamAI-specific errors
+      ValueError: For invalid inputs
+  """
+  jamai = JamAI(
+    project_id=PROJECT_ID,
+    api_base=JAMAI_API_BASE,
+    timeout=JAMAI_TIMEOUT_SEC
+    # token=JAMAI_TOKEN
+  )
+  input_table_timestamp = parse_timestamp_from_id(input_table_id_step3b, INPUT_TABLE_PREFIX)
+  output_table_id = setup_output_table(jamai, input_table_timestamp)
+  pipeline_logger.info(f"Successfully created output table 3c: {output_table_id}")
+  rows = get_data_from_input_table(jamai, input_table_timestamp)
+  add_rows_to_output_table(jamai, output_table_id, rows)
+  pipeline_logger.info(f"Successfully added {len(rows)} rows to output table 3c: {output_table_id}")
+  return output_table_id
+
+
+def main():
+  """Command line interface for the script."""
+  parser = argparse.ArgumentParser(
+    description="Filter rows needing masking from input table and chunk segments."
+  )
+  parser.add_argument("--input-table-step1", default=None)
+  parser.add_argument("--input-table-step3b", default=None,
+                      help=f"Specify input table name (e.g., {INPUT_TABLE_PREFIX}YYYYMMDD_HHMMSS)")
+  parser.add_argument("--limit", type=int, default=None,
+                      help="Limit total rows to process")
+
+  args = parser.parse_args()
+
+  try:
+    run_step(
+      input_table_id_step1=args.input_table_step1,
+      input_table_id_step3b=args.input_table_step3b,
+    )
+  except Exception as e:
+    pipeline_logger.opt(exception=True).error(f"Error: {str(e)}")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+  main()

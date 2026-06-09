@@ -1,0 +1,212 @@
+# maskaudio_stereoloop_v2.py
+import os
+from os.path import join
+import sys
+import argparse
+import subprocess
+from datetime import datetime
+from dotenv import load_dotenv
+# test relative import
+try:
+    from Masking.utils import restart_whisper_services, stop_vllm_services, start_vllm_services
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+    from utils import restart_whisper_services, stop_vllm_services, start_vllm_services
+
+load_dotenv()
+
+maskaudio_stereoloop_logger = LOGGER.bind(type="pipeline",service_name="maskaudio_stereoloop")
+
+# --- Configuration ---
+# Assume the schema-based scripts are in the same directory or accessible via PATH
+SCRIPT_BASE_PATH=os.getenv("SCRIPT_BASE_PATH", "/home/trbsysadmin/git/thai-masking/Masking")
+SCRIPT_1 = join(SCRIPT_BASE_PATH, "transcribe_stereoloop_schema_v2.py") #"/home/trbsysadmin/git/thai-masking/Masking/transcribe_stereoloop_schema_v2.py"
+SCRIPT_1_5 = join(SCRIPT_BASE_PATH, "add_masking_column_schema.py") #"/home/trbsysadmin/git/thai-masking/Masking/add_masking_column_schema.py"
+SCRIPT_2 = join(SCRIPT_BASE_PATH, "step2_mask_chunk_schema.py") #"/home/trbsysadmin/git/thai-masking/Masking/step2_mask_chunk_schema.py"
+SCRIPT_2B = join(SCRIPT_BASE_PATH, "step2b_phase_chunk_schema.py") #"/home/trbsysadmin/git/thai-masking/Masking/step2_mask_chunk_schema_v2.py"
+SCRIPT_3 = join(SCRIPT_BASE_PATH, "getTS_mask_chunk_schema_v2.py") #"/home/trbsysadmin/git/thai-masking/Masking/getTS_mask_chunk_schema_v2.py"
+SCRIPT_3B = join(SCRIPT_BASE_PATH, "get_wordTS_mask_chunk.py") #"/home/trbsysadmin/git/thai-masking/Masking/getTS_mask_chunk_schema_v2b.py"
+SCRIPT_4 = join(SCRIPT_BASE_PATH, "mask_with_jamai_schema_v2.py") #"/home/trbsysadmin/git/thai-masking/Masking/mask_with_jamai_schema_v2.py"
+VLLM_USE_SLEEP=int(os.getenv("VLLM_USE_SLEEP", 1)) == 1
+
+# Table Prefixes (should match those defined in the individual scripts)
+STEP1_TABLE_PREFIX = "step1_"
+STEP2_TABLE_PREFIX = "step2_"
+STEP2B_TABLE_PREFIX = "step2b_"
+STEP3_TABLE_PREFIX = "step3_"
+STEP3B_TABLE_PREFIX = "step3b_"
+
+# --- Helper Function to Run Scripts ---
+def run_script(script_name, args_list):
+    """Executes a python script with given arguments using subprocess."""
+    command = [sys.executable, script_name] + args_list
+    maskaudio_stereoloop_logger.info("\n--- Running Command ---")
+    maskaudio_stereoloop_logger.info(f"{' '.join(command)}")
+    maskaudio_stereoloop_logger.info("-----------------------")
+    try:
+        process = subprocess.run(command, text=True, capture_output=False)  # No check=True
+        
+        if process.returncode == 0:
+            return True
+        elif process.returncode == 10:
+            maskaudio_stereoloop_logger.info("Step1: 0 credit card info detected. Exiting gracefully.")
+            sys.exit(0)
+        elif process.returncode == 30:
+            maskaudio_stereoloop_logger.info("Step3: 0 payment card rows detected. Exiting gracefully.")
+            sys.exit(0)
+        else:
+            # Critical error (unexpected return code)
+            raise subprocess.CalledProcessError(  # Re-raise as an exception
+                returncode=process.returncode,
+                cmd=command,
+                output=None,
+                stderr=None
+            )
+    except FileNotFoundError:
+        maskaudio_stereoloop_logger.error(f"✗ Script '{script_name}' not found.")
+        return False
+    except Exception as e:
+        maskaudio_stereoloop_logger.opt(exception=True).error(f"✗ UNEXPECTED ERROR in '{script_name}': {str(e)}")
+        return False
+
+# --- Main Execution Logic ---
+def main():
+    parser = argparse.ArgumentParser(description="Orchestrator script to run the audio masking pipeline.")
+    parser.add_argument("--input", required=True, help="Root directory containing audio files (WAV/MP3). Example: ~/CSH_SH")
+    parser.add_argument("--output", required=True, help="Root directory for final masked audio files. Example: ~/CSH_SH_MASKED")
+    parser.add_argument("--option", required=True, choices=['mask'], help="Processing option ('mask' currently supported).") # 'all' not implemented yet
+    parser.add_argument("--transcribe", required=True, help="Directory for JSON transcription cache. Example: ~/CSH_SH_json")
+    parser.add_argument("--limit", type=int, default=None, help="Limit the number of initial audio files to process. Default: process all.")
+    parser.add_argument("--skip-restart", action="store_true", help="Skip restarting the transcription service.")
+    parser.add_argument("--model", help="Root directory transcribe model", default="/home/ubuntu/local_model/mounted/final_whisper-th-large-v3-ct2")
+    args = parser.parse_args()
+
+    # --- Restart Transcription Service (unless skipped) ---
+    restart_whisper_services(not args.skip_restart)
+    if not args.skip_restart:
+        stop_vllm_services(VLLM_USE_SLEEP)
+
+    # --- Validate Arguments ---
+    input_dir = os.path.abspath(os.path.expanduser(args.input))
+    output_dir = os.path.abspath(os.path.expanduser(args.output))
+    transcribe_dir = os.path.abspath(os.path.expanduser(args.transcribe))
+    model_dir = os.path.abspath(os.path.expanduser(args.model))
+    limit_str = str(args.limit) if args.limit is not None else None
+
+    if not os.path.isdir(input_dir):
+        maskaudio_stereoloop_logger.error(f"✗ FATAL ERROR: Input directory not found: {input_dir}")
+        sys.exit(1)
+    if not os.path.isdir(transcribe_dir):
+        maskaudio_stereoloop_logger.warning(f"Warning: Transcription cache directory not found, will be created by script 1: {transcribe_dir}")
+    # Output dir will be created by script 4 if needed
+
+    if args.option == 'all':
+        maskaudio_stereoloop_logger.warning("Warning: '--option all' is not yet implemented. Running standard 'mask' pipeline.")
+        # Proceed with 'mask' logic for now
+
+    # --- Generate Unique Suffix for this Run ---
+    run_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    maskaudio_stereoloop_logger.info(f"\nGenerated Run Suffix: {run_suffix}")
+
+    # --- Construct Intermediate Table Names ---
+    input_table_step1_name = f"{STEP1_TABLE_PREFIX}{run_suffix}"
+    step2_table_name = f"{STEP2_TABLE_PREFIX}{run_suffix}"
+    step2b_table_name = f"{STEP2B_TABLE_PREFIX}{run_suffix}"
+    step3_table_name = f"{STEP3_TABLE_PREFIX}{run_suffix}"
+    step3b_table_name = f"{STEP3B_TABLE_PREFIX}{run_suffix}"
+
+    maskaudio_stereoloop_logger.info(f"Intermediate Table Names for this run:")
+    maskaudio_stereoloop_logger.info(f"  Step 1 Output: {input_table_step1_name}")
+    maskaudio_stereoloop_logger.info(f"  Step 2 Output: {step2_table_name}")
+    maskaudio_stereoloop_logger.info(f"  Step 2b Output: {step2b_table_name}")
+    maskaudio_stereoloop_logger.info(f"  Step 3 Output: {step3_table_name}")
+    maskaudio_stereoloop_logger.info(f"  Step 3b Output: {step3b_table_name}")
+
+    # --- Execute Pipeline Steps ---
+
+    # Step 1: Transcription and Upload
+    script1_args = [
+        "--input", input_dir,
+        "--jsondir", transcribe_dir,
+        "--output-suffix", run_suffix,
+        "--model", model_dir,  # Use the generated suffix
+        "--text-format", "range",
+    ]
+    if limit_str:
+        script1_args.extend(["--limit", limit_str])
+    if not run_script(SCRIPT_1, script1_args):
+        sys.exit(1) # Stop pipeline if script fails
+
+    restart_whisper_services(not args.skip_restart)
+    if not args.skip_restart:
+        start_vllm_services(VLLM_USE_SLEEP)
+
+    # Step 1.5: Add Masking Column and Copy NO Files
+    maskaudio_stereoloop_logger.info("\n--- Step 1.5: Adding Masking Column & Copying NO Files ---")
+    script1_5_args = [
+        "--table-name", input_table_step1_name,
+        "--output-dir", output_dir
+    ]
+    if not run_script(SCRIPT_1_5, script1_5_args):
+        sys.exit(1) # Stop pipeline if script fails
+
+    # Step 2: Filter and Chunk
+    # Note: We use the table created by Script 1 as input.
+    # We don't pass a limit here, assuming it processes all relevant rows from step 1's output.
+    script2_args = [
+        "--input-table", input_table_step1_name
+        # Add --limit here if you want to limit rows processed *in this step*
+        # Add --context-limit if you want to override the default in script 2
+    ]
+    if not run_script(SCRIPT_2, script2_args):
+        sys.exit(1)
+
+    # Step 2b: Split into mini-phases
+    # Note: We use the table created by Script 2 as input.
+    # We don't pass a limit here, assuming it processes all relevant rows from step 2's output.
+    script2b_args = [
+        "--input-table", step2_table_name
+    ]
+    if not run_script(SCRIPT_2B, script2b_args):
+        sys.exit(1)
+
+    # Step 3: Get Timestamps (Process/Reduce Segments)
+    # Note: Uses outputs from Script 1 and Script 2.
+    # No limit passed here by default.
+    script3_args = [
+        "--input-table-step2", step2b_table_name
+        # Add --limit here if you want to limit groups processed *in this step*
+        # Add --context-limit if you want to override the default in script 3
+    ]
+    if not run_script(SCRIPT_3, script3_args):
+        sys.exit(1)
+
+    # Step 3b: Get Timestamps (Process/Reduce Segments)
+    # Note: Uses output from Script 3.
+    # No limit passed here by default.
+    script3b_args = [
+        "--input-table-step1", input_table_step1_name,
+        "--input-table-step3", step3_table_name
+        # Add --limit here if you want to limit groups processed *in this step*
+        # Add --context-limit if you want to override the default in script 3
+    ]
+    if not run_script(SCRIPT_3B, script3b_args):
+        sys.exit(1)
+
+    # Step 4: Apply Masking
+    # Note: Uses output from Script 3b.
+    # No limit passed here by default.
+    script4_args = [
+        "--input-table", step3b_table_name,
+        "--output-dir", output_dir
+        # Add --limit here if you want to limit files masked *in this step*
+    ]
+    if not run_script(SCRIPT_4, script4_args):
+        sys.exit(1)
+
+    maskaudio_stereoloop_logger.info("\n--- Pipeline Completed Successfully ---")
+    maskaudio_stereoloop_logger.info(f"Masked audio files should be in: {output_dir}")
+
+if __name__ == "__main__":
+    main()

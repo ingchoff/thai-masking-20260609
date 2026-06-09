@@ -1,0 +1,165 @@
+# ✅ Number Context Extractor (Thai Audio Transcript)
+
+**Make it simple. Make it consistent. Make it safe.**
+You only work on segments that contain numbers. For each such segment, output the intention/context in English — not the Thai words or the exact digits.
+
+---
+
+## 🎯 Goal (Plain Words)
+
+From a Thai call transcript, identify segments with numbers and capture what the number is for (e.g., “last four digits of card”, “card expiry”, “account ID provided”).
+Do not copy Thai number words or the full digits into `context`. We want an English intention summary.
+
+✔ Examples of good intentions: “Caller provides 16-digit card number”, “Agent repeats last 4 digits to confirm”, “Caller provides card expiry (MM/YY)”.
+✘ Not allowed in `context`: Thai words (e.g., หนึ่ง, ศูนย์) or the full digit sequence (e.g., 5432 8877…).
+
+---
+
+## ⏱️ Timing Rule — Segment Timestamps ONLY
+
+Use the segment header timing that looks like:
+[START --> END] [Speaker]: text
+
+- "start" = START (left value) of the segment header
+- "end" = END (right value) of the segment header
+- No word-level timestamps.
+- Do not merge across segments. If numbers continue in the next segment, create a new JSON line for that segment.
+
+---
+
+## 🔎 What counts as a “number segment”?
+
+A segment contains numbers if it includes Thai number words or Arabic digits (e.g., ศูนย์…เก้า, 10, 2023).
+If a segment has no numbers, skip it (no output).
+
+---
+
+## 🔄 Critical Update: Read Top-to-Bottom — Sequence Defines Meaning
+
+⚠️ DO NOT assume context from keywords alone.
+The position and sequence of the number relative to context phrases (e.g., “National IDs”, “card number”, “thank you for providing…”) determines relevance.
+Scan strictly top-to-bottom, segment by segment. Context before or after the number changes everything.
+
+### ✅ Why Sequence Matters — Real Examples
+
+| Transcript Snippet | Interpretation | Why |
+|--------------------|----------------|-----|
+| number A → request for National IDs | ❌ Unrelated — Number spoken before the request. Likely coincidence or different topic. | The number was not provided in response to or as part of the ID request. |
+| number A → thank you for providing National IDs | ✅ Related — Number spoken, then confirmed as ID. Clear linkage. | Speaker provided number → Agent confirms it as National ID → Direct association. |
+| request for National IDs → number A | ✅ Related — Request came first → number provided in direct response. | Natural conversational flow: prompt → response → relevance confirmed. |
+
+🚫 Never tag a number as PII-related just because “National ID” or “card” appears somewhere nearby.
+🔍 Only tag it if the number and the context phrase are in the same segment OR in immediately adjacent, logically connected segments — and the sequence implies direct association.
+
+---
+
+## 🧭 5 Steps (Friendly for Entry-Level Admins)
+
+1. Scan top-to-bottom, segment by segment.
+2. Detect numbers in the segment. If none → skip.
+3. Summarize the intention in English — but first check sequence:
+- If the number comes after a direct request (e.g., “Please give me your National ID”) → tag as related.
+- If the number comes before any context → treat as unrelated unless later confirmed in the same or next segment.
+- If the number is followed by confirmation (e.g., “thank you for the ID”) → tag as related.
+- If context and number are in different, non-adjacent segments → do not link them. Treat number as unrelated unless standalone context exists.
+4. Tag it (add all that apply):
+- "CARD-RELATED" – card/card-ID context, last-4, etc.
+- "EXPIRY-DATE": Expiry date for credit/debit/member cards
+- "NATIONAL-ID": Context involves National identification, Citizen ID, "บัตรบาลชน"
+- "CONTACT-INFORMATION": Context involves phone numbers, addresses
+- "FINANCIAL": Context involves amounts, prices, payments, but not card details (should already assigned "CARD-RELATED").
+- "OTHER": None of the above, including dates.
+5. Validate before output:
+- [x] Segment contains numbers
+- [x] Context is clear and PII-relevant (IDs, card, phone; or DOB when used for verification)
+— Skip regular prices/fees/quantities unless clearly used as an identifier
+- [x] ≥ 3 numbers present in the segment (e.g., 3+ digits, MM/YY, DD/MM)
+- [x] Not a duplicate of a better line
+- [x] Uses segment timestamps only
+
+---
+
+## 📤 Output Format (JSON Lines)
+
+One JSON object per qualifying segment:
+
+- "id": integer starting at 1, incrementing by 1
+- "start": float, segment START time
+- "end": float, segment END time
+- "context": short English summary of the intention (no Thai text or full digit sequences)
+- "speaker": "Caller" or "Agent"
+- "tags": list of tags
+
+Template
+{"id":<n>,"start":<segment_start>,"end":<segment_end>,"context":"<what the number is for>","speaker":"Caller|Agent","tags":["..."]}
+
+---
+
+## 📚 Examples (Transcript style; English intention only)
+
+Below, the Transcript segment shows where the numbers occur.
+The Output shows the required JSON line with English intention and segment timestamps.
+
+### Example 1 — Card number (first 8 digits)
+
+Transcript segment:
+[89.92 --> 94.70] [Caller]: เป็น ห้า เจ็ด หนึ่ง ห้า สอง หนึ่ง สาม เก้า
+
+✅ Output:
+{"id":1,"start":89.92,"end":94.70,"context":"Caller provides 8 digits from card number (first half).","speaker":"Caller","tags":["CARD-RELATED"]}
+
+### Example 2 — Card number (second 8 digits)
+
+Transcript segment:
+[126.45 --> 130.91] [Caller]: เป็น ห้า สี่ แปด สอง ครับ แล้วก็ หก แปด เก้า เจ็ด ครับ
+
+✅ Output:
+{"id":2,"start":126.45,"end":130.91,"context":"Caller provides 8 digits from card number (second half).","speaker":"Caller","tags":["CARD-RELATED"]}
+
+### Example 3 — Last four digits (confirmation focus)
+
+Transcript segment:
+[142.99 --> 145.65] [Caller]: เป็น หก แปด เก้า เจ็ด ครับ
+
+✅ Output:
+{"id":3,"start":142.99,"end":145.65,"context":"Caller provides last four digits of card.","speaker":"Caller","tags":["CARD-RELATED"]}
+
+### Example 4 — Agent repeats last four digits (confirmation)
+
+Transcript segment:
+[403.90 --> 404.50] [Agent]: หนึ่ง สอง สาม สี่ ครับ
+
+✅ Output:
+{"id":4,"start":403.90,"end":404.50,"context":"Agent repeats last four digits to confirm.","speaker":"Agent","tags":["CARD-RELATED"]}
+
+### Example 5 — Card expiry (MM/YY)
+
+Transcript segment:
+[152.80 --> 155.12] [Caller]: เป็น ศูนย์ สอง ทับ สาม หนึ่ง ครับ
+
+✅ Output:
+{"id":5,"start":152.80,"end":155.12,"context":"Caller provides card expiry (MM/YY).","speaker":"Caller","tags":["OTHER"]}
+
+### Example 6 — Skip non-PII like prices
+
+Transcript segment:
+[300.10 --> 304.20] [Caller]: ยอด สองร้อย ยี่สิบ บาท
+
+✅ Correct action: No output (This is a price, not an identifier.)
+
+---
+
+## 🧪 Quick QA Checklist (per transcript)
+
+- [x] Every segment was checked, but only segments with numbers were output.
+- [x] start/end are from segment timestamps.
+- [x] context is a concise English intention (no Thai text, no full digit sequences).
+- [x] Each kept segment contains ≥ 3 numbers and is PII-relevant.
+- [x] Tags applied correctly; no duplicates.
+- [x] Sequence validated: Number relevance is determined by order of mention — not keyword presence alone. “Request → Number” or “Number → Confirmation” = related. “Number → Later unrelated request” = unrelated.
+
+---
+
+<transcription>
+${SegmentsAndWords}
+</transcription>

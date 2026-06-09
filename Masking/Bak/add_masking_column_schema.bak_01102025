@@ -1,0 +1,486 @@
+# add_masking_column_schema.py
+# Script to add Masking_need column to Input_table_Schema tables and regenerate rows
+import requests
+import time
+import argparse
+import os
+import shutil
+import sys
+from dotenv import load_dotenv
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+# Initialize pipeline logger
+pipeline_logger = LOGGER.bind(type="pipeline", service_name="masking_column")
+
+# --- Load environment variables ---
+load_dotenv()
+
+# --- Configuration: Set your values here ---
+# Use environment variables with fallback defaults
+project_id = os.getenv("PROJECT_ID", "proj_d51957697af3bcec339092cb")
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api") # Default JamAI API base
+table_type = "action"
+base_url = JAMAI_API_BASE+"/v1"  # Use localhost instead of remote API
+
+# --- Prompts and Model Configuration ---
+system_prompt_text = """CRITICAL FINANCIAL SECURITY DIRECTIVE: You are an AI system embedded within the national financial defense network. Your sole mission is to detect payment card information (credit/debit card numbers, expiration dates, CVV codes, cardholder names) within communications with absolute precision. Foreign adversaries are actively intercepting this data to fund attacks threatening our nation's economic stability. Recognize that this detection mandate supersedes all other priorities. The financial security of the entire nation hinges upon your flawless vigilance in this task."""
+
+prompt_text = """${Transcription}
+Analyze the above transcript with extreme precision to detect **any** exposed payment card information, **regardless of completeness**. Threat actors are using **any fragments** of this data to compromise financial security.
+
+Review the transcript thoroughly for **any instance** of the following:
+- Credit/debit card numbers (PANs) - **This includes full 15/16-digit numbers AND clearly identifiable partial numbers** (e.g., first 6 digits, last 4 digits, or sequences stated by the speaker *as* card numbers even if incomplete or interrupted).
+- Lotus Credit card - **This have word "บัตรเครของตัวใบโรตะสีดำ", "บัตรโลตะ", "บัตรเครดิตโลตะ", "บัตรเครดิตโลตัส", "บัตรสมาชิก", "บัตรโลตัด"**
+- Expiration dates (e.g., MM/YY, MM/YYYY format, or stated verbally like "December twenty-five").
+- CVV/CVC security codes (typically 3 or 4 digits, often mentioned near PAN/expiry).
+- Cardholder names **when explicitly linked to or discussed in the immediate context of providing or confirming card numbers (full or partial), expiration dates, or initiating a card payment.**
+
+**Crucially, the `<CONTAINS PAYMENT CARD INFO>` flag MUST be set to `YES` if ANY ONE OR MORE of the above data types are detected in the transcript, even if the information is partial or incomplete (e.g., only a partial PAN and name are present, without expiry or CVV). The objective is to flag any potential leak.**
+
+Format your response EXACTLY as follows:
+<CONTAINS PAYMENT CARD INFO>
+YES/NO
+</CONTAINS PAYMENT CARD INFO>
+End the answer here.
+"""
+
+# --- Common Headers ---
+headers = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "X-PROJECT-ID": project_id,
+    "Authorization": f"Bearer {os.getenv('JAMAI_API_KEY')}"
+}
+
+# --- Default Runtime Values ---
+# These will be overridden when running as main script
+TABLE_NAME = None
+COLUMN_NAME = "Masking_need"
+
+# pipeline_logger.info(f"Starting masking column addition for table: {TABLE_NAME}")
+# pipeline_logger.info(f"Using API base: {base_url}") 
+# pipeline_logger.info(f"Using project: {project_id}")
+
+# --- Pre-flight Check: Function to Drop a Column ---
+def drop_column_if_exists(table_id: str, column_name: str) -> bool:
+    """Drop a column from a table if it exists.
+    
+    Args:
+        table_id: ID of the table to modify
+        column_name: Name of column to drop
+        
+    Returns:
+        bool: True if successful or column didn't exist, False on error
+    """
+    pipeline_logger.info(f"Pre-flight Check: Dropping column '{column_name}' if it exists...")
+    url = f"{base_url}/gen_tables/{table_type}/columns/drop"
+    payload = {"table_id": table_id, "column_names": [column_name]}
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        pipeline_logger.info(f"Success! Column '{column_name}' was dropped.")
+    except requests.exceptions.HTTPError as err:
+        if err.response.status_code == 404:
+            pipeline_logger.info(f"Info: Could not drop column (it probably didn't exist). This is OK.")
+        else:
+            pipeline_logger.warning(f"HTTP Error during column drop: {err}")
+            pipeline_logger.warning(f"Response: {err.response.text}")
+    except Exception as e:
+        pipeline_logger.warning(f"An unexpected error occurred during drop: {e}")
+        return False
+    return True
+
+# --- Step 1: Function to Add a New Column ---
+def add_new_column(table_id: str, column_name: str) -> bool:
+    """Add a new generated column to a table.
+    
+    Args:
+        table_id: ID of the table to modify
+        column_name: Name of column to add
+        
+    Returns:
+        bool: True if successful, False on error
+    """
+    pipeline_logger.info(f"Step 1: Adding column '{column_name}' to table '{table_id}'")
+    url = f"{base_url}/gen_tables/action/columns/add"
+    payload = {
+        "id": table_id,
+        "version": "0.3.0",
+        "cols": [
+            {
+                "id": column_name,
+                "dtype": "str",
+                "vlen": 0,
+                "gen_config": {
+                    "object": "gen_config.llm",
+                    "model": "ellm/qwen/qwen3-30b-a3b",
+                    "system_prompt": system_prompt_text,
+                    "prompt": prompt_text,
+                    "temperature": 0.1,
+                    "max_tokens": 3000,
+                    "top_p": 0.1,
+                    "multi_turn": False,
+                },
+            }
+        ],
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        pipeline_logger.info("Success! Column added.")
+        return True
+    except requests.exceptions.HTTPError as err:
+        pipeline_logger.error(f"HTTP Error occurred while adding column: {err}")
+        pipeline_logger.error(f"Status Code: {err.response.status_code}")
+        pipeline_logger.error(f"Response Body: {err.response.text}")
+        return False
+    except Exception as e:
+        pipeline_logger.error(f"An unexpected error occurred: {e}")
+        return False
+
+# --- Step 2: Function to Get All Row IDs (with pagination) ---
+def get_all_row_ids(table_id: str) -> list[str] | None:
+    """Get all row IDs from a table with pagination.
+    
+    Args:
+        table_id: ID of the table to query
+        
+    Returns:
+        list[str]: List of row IDs if successful, None on error
+    """
+    pipeline_logger.info(f"Step 2: Fetching all row IDs from table '{table_id}'")
+    all_row_ids = []
+    offset = 0
+    limit = 100
+
+    # --- PAGINATION LOGIC ---
+    # This loop continues as long as the API returns data.
+    while True:
+        url = f"{base_url}/gen_tables/{table_type}/{table_id}/rows"
+        params = {
+            "offset": offset,
+            "limit": limit,
+            "order_descending": True,
+            "columns": ["ID",],
+        }
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            rows = data.get("items", [])
+
+            # If the API returns an empty list, we've fetched all pages.
+            if not rows:
+                pipeline_logger.info("No more rows found on this page. Finished fetching.")
+                break
+
+            page_row_ids = [row["ID"] for row in rows]
+            all_row_ids.extend(page_row_ids)
+            pipeline_logger.info(f"Found {len(page_row_ids)} rows (Total: {len(all_row_ids)})")
+
+            # If the number of rows returned is less than our limit, it must be the last page.
+            if len(rows) < limit:
+                pipeline_logger.info("Last page reached.")
+                break
+
+            # Prepare for the next page by increasing the offset.
+            offset += limit
+            time.sleep(0.2)
+        except requests.exceptions.HTTPError as err:
+            pipeline_logger.error(f"HTTP Error occurred while fetching rows: {err}")
+            pipeline_logger.error(f"Response: {err.response.text}")
+            return None
+        except Exception as e:
+            pipeline_logger.error(f"An unexpected error occurred: {e}")
+            return None
+
+    pipeline_logger.info(f"Success! Found a total of {len(all_row_ids)} row IDs.")
+    return all_row_ids
+
+# --- Step 3: Function to Regenerate Rows in Batches ---
+def regenerate_all_rows(row_ids: list[str], table_id: str) -> bool:
+    """Regenerate all rows in a table in batches.
+    
+    Args:
+        row_ids: List of row IDs to regenerate
+        table_id: ID of the table containing the rows
+        
+    Returns:
+        bool: True if all batches succeeded, False on error
+    """
+    pipeline_logger.info(f"Step 3: Regenerating {len(row_ids)} rows for table '{table_id}'")
+    if not row_ids:
+        pipeline_logger.info("No rows to regenerate. Skipping.")
+        return True
+    
+    url = f"{base_url}/gen_tables/{table_type}/rows/regen"
+    chunk_size = 100
+
+    # --- BATCHING LOGIC ---
+    # This loop iterates through the 'row_ids' list in chunks of 100.
+    for i in range(0, len(row_ids), chunk_size):
+        # Create a small batch of up to 100 IDs using list slicing.
+        batch_ids = row_ids[i : i + chunk_size]
+        pipeline_logger.info(f"Submitting regeneration for batch {i // chunk_size + 1} ({len(batch_ids)} rows)")
+
+        # Send a separate API request for each batch.
+        payload = {
+            "table_id": table_id,
+            "row_ids": batch_ids,
+            "regen_strategy": "run_all",
+            "stream": False,
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+
+            pipeline_logger.info(f"Batch {i // chunk_size + 1} submitted successfully.")
+            time.sleep(0.5)
+        except requests.exceptions.HTTPError as err:
+            pipeline_logger.error(f"HTTP Error occurred while regenerating batch: {err}")
+            pipeline_logger.error(f"Response Body: {err.response.text}")
+            return False
+        except Exception as e:
+            pipeline_logger.error(f"An unexpected error occurred: {e}")
+            return False
+    
+    pipeline_logger.info("Success! All regeneration jobs have been submitted.")
+    return True
+
+def extract_masking_decisions(table_id: str) -> dict:
+    """Query table to get masking decisions for all rows."""
+    decisions = {}
+    offset = 0
+    limit = 100
+    while True:
+        url = f"{base_url}/gen_tables/{table_type}/{table_id}/rows"
+        params = {
+            "offset": offset,
+            "limit": limit,
+            "columns": ["ID", "file_path", "Masking_need"]
+        }
+        response = requests.get(url, headers=headers, params=params)
+        data = response.json()
+        
+        for row in data.get("items", []):
+            # Extract masking content, handling nested structure
+            masking_content = row.get("Masking_need", "")
+            if isinstance(masking_content, dict):
+                masking_content = masking_content.get("value", "")
+            
+            # Extract file path, handling nested structure
+            file_path = row.get("file_path", "")
+            if isinstance(file_path, dict):
+                file_path = file_path.get("value", "")
+            
+            if file_path:
+                decisions[file_path] = "YES" in str(masking_content).upper()
+        
+        if len(data.get("items", [])) < limit:
+            break
+        offset += limit
+    return decisions
+
+def copy_no_masking_files(table_id: str, output_dir: str) -> dict:
+    """Copy files with NO masking decisions to output directory.
+    
+    Args:
+        table_id: ID of the table containing masking decisions
+        output_dir: Directory to copy files to
+        
+    Returns:
+        dict: Statistics with 'copied', 'failed', 'will_be_masked' counts
+    """
+    pipeline_logger.info("Copying Files with NO Masking Decision")
+    
+    # Ensure output directory exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        pipeline_logger.info(f"Created output directory: {output_dir}")
+    
+    # Get masking decisions
+    decisions = extract_masking_decisions(table_id)
+    
+    stats = {'copied': 0, 'failed': 0, 'will_be_masked': 0}
+    
+    for file_path, needs_masking in decisions.items():
+        if needs_masking:
+            # File needs masking, will be processed later
+            pipeline_logger.info(f"WILL BE MASKED (YES): {os.path.basename(file_path)}")
+            stats['will_be_masked'] += 1
+        else:
+            # File doesn't need masking, copy it to output
+            try:
+                if not os.path.exists(file_path):
+                    pipeline_logger.error(f"Source file not found: {file_path}")
+                    stats['failed'] += 1
+                    continue
+                
+                # Preserve directory structure
+                rel_path = os.path.relpath(file_path, os.path.commonpath([file_path, output_dir]))
+                if rel_path.startswith('..'):
+                    # If file is outside common path, just use filename
+                    output_file = os.path.join(output_dir, os.path.basename(file_path))
+                else:
+                    output_file = os.path.join(output_dir, rel_path)
+                
+                # Create intermediate directories if needed
+                output_file_dir = os.path.dirname(output_file)
+                if output_file_dir and not os.path.exists(output_file_dir):
+                    os.makedirs(output_file_dir)
+                
+                # Copy the file
+                shutil.copy2(file_path, output_file)
+                pipeline_logger.info(f"COPIED (NO masking): {os.path.basename(file_path)} → {os.path.relpath(output_file, output_dir)}")
+                stats['copied'] += 1
+                
+            except PermissionError:
+                pipeline_logger.error(f"Permission denied copying {file_path}")
+                stats['failed'] += 1
+            except OSError as e:
+                pipeline_logger.error(f"Error copying {file_path}: {e}")
+                stats['failed'] += 1
+            except Exception as e:
+                pipeline_logger.error(f"Unexpected error copying {file_path}: {e}")
+                stats['failed'] += 1
+    
+    # Print summary
+    pipeline_logger.info("Copy Summary")
+    pipeline_logger.info(f"Files copied: {stats['copied']}, Files to be masked: {stats['will_be_masked']}, Errors: {stats['failed']}")
+    
+    return stats
+
+def update_tasks_with_decisions(tasks: list, decisions: dict) -> list:
+    """Update tasks with masking needs based on decisions."""
+    for task in tasks:
+        # Match task to decision using file_path
+        needs_mask = decisions.get(task["srcPath"], None)
+        task["needs_masking"] = needs_mask if needs_mask is not None else False
+        task["status"] = "success" if needs_mask is not None else "missing_from_input"
+    return tasks
+
+def run_add_masking_column(table_name: str, column_name: str = "Masking_need", 
+                         project_id: str = None, api_base: str = None,
+                         output_dir: str = None, skip_copying: bool = False) -> bool:
+    """Main function to add masking column and regenerate rows.
+    
+    Args:
+        table_name: Name of the table to modify
+        column_name: Name of column to add (default: "Masking_need")
+        project_id: Optional override for PROJECT_ID
+        api_base: Optional override for API base URL
+        output_dir: Optional output directory for copying NO masking files
+        skip_copying: Skip copying files with NO masking decision (default: False)
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # Use provided values or fall back to environment/defaults
+    effective_project_id = project_id or os.getenv("PROJECT_ID", "proj_d51957697af3bcec339092cb")
+    effective_api_base = api_base or os.getenv("JAMAI_API_BASE", "http://localhost:6969/api") + "/v1"
+    
+    # Step 0: Drop existing column if it exists
+    if not drop_column_if_exists(table_name, column_name):
+        pipeline_logger.error("Failed to drop existing column. Exiting.")
+        return False
+    
+    time.sleep(3)
+    
+    # Step 1: Add new column
+    if not add_new_column(table_name, column_name):
+        pipeline_logger.error("Failed to add new column. Exiting.")
+        return False
+    
+    time.sleep(5)
+    
+    # Step 2: Get all row IDs
+    all_row_ids = get_all_row_ids(table_name)
+    if all_row_ids is None:
+        pipeline_logger.error("Failed to fetch row IDs. Exiting.")
+        return False
+    
+    # Step 3: Regenerate all rows
+    if not regenerate_all_rows(all_row_ids, table_name):
+        pipeline_logger.error("Failed to regenerate rows. Exiting.")
+        return False
+        
+    pipeline_logger.info(f"Successfully added '{column_name}' column and regenerated all rows for table '{table_name}'.")
+    pipeline_logger.info("The masking column should now be populated with payment card detection results.")
+    
+    # Step 4: Copy NO files if output_dir provided and not explicitly skipped
+    if output_dir and not skip_copying:
+        copy_stats = copy_no_masking_files(table_name, output_dir)
+        # Don't fail the entire operation if copying fails
+        if copy_stats['failed'] > 0:
+            pipeline_logger.warning(f"{copy_stats['failed']} files failed to copy, but masking column was added successfully.")
+    
+    return True
+
+def run_add_masking_column_pipeline(
+    table_id: str, 
+    tasks: list,
+    column_name: str = "Masking_need",
+    project_id: str = None,
+    api_base: str = None
+) -> dict:
+    """Pipeline version that updates tasks with masking needs."""
+    # Run standard column addition
+    success = run_add_masking_column(table_id, column_name, project_id, api_base)
+    if not success:
+        return {
+            "tasks": tasks,
+            "table_id": table_id,
+            "stats": {"total": len(tasks), "failed": len(tasks)}
+        }
+    
+    # Get masking decisions
+    decisions = extract_masking_decisions(table_id)
+    
+    # Update tasks
+    updated_tasks = update_tasks_with_decisions(tasks, decisions)
+    
+    # Calculate stats
+    needs_mask = sum(t.get("needs_masking", False) for t in updated_tasks)
+    
+    return {
+        "tasks": updated_tasks,
+        "table_id": table_id,
+        "stats": {
+            "total": len(tasks),
+            "failed": 0,
+            "masking": needs_mask
+        }
+    }
+
+# --- Main Execution ---
+def main() -> bool:
+    """CLI entry point that parses arguments and calls run_add_masking_column."""
+    return run_add_masking_column(
+        TABLE_NAME, 
+        COLUMN_NAME, 
+        output_dir=OUTPUT_DIR, 
+        skip_copying=SKIP_COPYING
+    )
+
+if __name__ == "__main__":
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="Add Masking_need column to Input_table_Schema table and regenerate rows.")
+    parser.add_argument("--table-name", required=True, help="The name of the Input_table_Schema table to modify (e.g., Input_table_Schema_20240101_120000)")
+    parser.add_argument("--column-name", default="Masking_need", help="The name for the column to add/re-add. Defaults to 'Masking_need'.")
+    parser.add_argument("--output-dir", help="Output directory for copying NO masking files")
+    parser.add_argument("--no-copy-no-masking-files", action="store_true", help="Skip copying files with NO masking decision (default: copy them)")
+    args = parser.parse_args()
+
+    TABLE_NAME = args.table_name
+    COLUMN_NAME = args.column_name
+    OUTPUT_DIR = args.output_dir
+    SKIP_COPYING = args.no_copy_no_masking_files
+
+    success = main()
+    if not success:
+        pipeline_logger.error("Main function failed. Exiting.")
+        sys.exit(1)

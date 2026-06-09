@@ -1,0 +1,78 @@
+# 🧾 FINAL: THAILAND-SPECIFIC CREDIT CARD PAN IDENTIFICATION MANUAL
+
+### ✅ Supports Arabic Numerals AND Thai Digit Words — EVEN WHEN GLUED, MIS-ASR’D, OR MIXED WITH TEXT
+### ✅ Legal Compliance First — If Context Says It’s a Card Number, You MUST Flag the Token
+### ✅ Downstream Masking Will Handle It — Your Job Is to Identify, Not Clean
+### ✅ Treat Thai digit words and Arabic digits interchangeably.
+
+---
+
+## ✅ STEP 0: LEGAL & TECHNICAL CONTEXT (THAILAND) — UPDATED
+
+> Under **PDPA** and **BOT guidelines**, **you must identify ANY token — no matter how messy — that context confirms refers to a payment card number.**
+>
+> - Even if it’s glued with “ครับ”, “นะ”, “ส”, etc.
+> - Even if it starts with “้า” or ends with “จ้า”
+> - Even if it’s only part of the number
+> - Even if it’s mis-segmented or mis-ASR’d
+>
+> ❗ **Failure to flag = compliance violation.**
+
+---
+
+## 🧩 STEP 1: Understanding and summarizing transcription
+
+> **Input**: A snippet of transcription is given in [[ ## Transcription ## ]]
+> **Goal**: Understand the content of the transcription accurately. Then provide the summary of it.
+> **Summary Focus**:
+- Identify the intention of the transcription, especially revolving the numbers sequence that are mentioned
+- Surgically identify and list out the important number sequences that are mentioned in the transcription and the "meaning" of the said numbers.
+- Categorize the meaning into one of these (Bear in mind that ASR error or incorrect splitting of transcription chunks may affect the completeness of the numbers):
+- credit card number: the 16 digits (or partial) credit card numbers. In Thailand Lotus card is also a credit card. Categorize ATM/debit card into this category. << This is the ONLY PAN related categories
+- expiry date: the expiration date of the credit card numbers.
+- CVV/CVS: the security code of the credit card numbers
+- National-ID: Thailand national ID (13 digits long), also known as citizen ID "บัตรบาลชน"
+- Phone Number: Any contact number provided, can be phone number, service center number, etc..
+- Address: numbers of addresses, like pos code, street/blocks number, etc..
+- Other: other numbers that are not in the above categories.
+- For each identified number, attach the time of which it appeared. Just use the transcription time as provided. If the number appeared more than once. List it all out.
+
+Guidelines:
+- Understanding the semantic flows are key for accurate intention understanding.
+- The order of semantic context is important clue to help identify the intention. *Which means understanding both before and after the numbers are important*
+example:
+- Here is the credit card number, [1234,and then, 3456, ...] -> The numbers are clearly credit card number.
+- This is the card number, [1234, 5678, ...]. Thank you for providing the card number, can I confirmed that it is the citizen card number of Mrs. Eve? -> Even at first it says card number, however later on it confirmed that it is referring to a citizen number. So this is National-ID
+- What's the expiry date? It's 0511. 0512? ok thank you for providing the number, now I repeat 123445676.... -> In this case, the 12344... is likely credit card number. But the 0511 should be expiry date. and 0512 is likely a misheard of 0511 thus it's also expiry date.
+
+
+## 🏷️ STEP 2: Put the detected numbers with the associated meaning and appearance time under the output section
+
+> **Goal**: Organize the detected numbers it into the output section
+> **Output Format:**
+- Put each of the detected numbers into the <Numbers Identity> section, line-by-line
+
+---
+
+## 📄 STEP 3: OUTPUT FORMAT
+
+<summary>
+...The summary of the transcription...
+</summary>
+
+<Numbers Identity>
+- list out the numbers and it's associated meaning and the time of which it appears.
+<Numbers Identity>
+
+---
+
+## ⚖️ LEGAL COMPLIANCE NOTE (THAILAND — FINAL)
+
+> Under **PDPA** and **BOT guidelines**, **any representation of a PAN — whether numeric or verbal — must be identified and protected** if it can be linked to a payment card. Failure to identify Thai digit word tokens (e.g., “ศูนย์สองหกสาม”) when context confirms they represent a PAN constitutes a compliance gap.
+
+---
+
+## Input:
+
+[[ ## Transcription ## ]]
+${SegmentsAndWords}

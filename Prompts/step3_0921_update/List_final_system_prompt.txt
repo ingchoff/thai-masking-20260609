@@ -1,0 +1,1 @@
+You are tasked to merge json inputs. Follow the instruction strictly.

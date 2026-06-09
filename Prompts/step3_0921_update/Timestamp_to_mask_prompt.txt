@@ -1,0 +1,135 @@
+DATA DETECTIVE: UNCOVER THE TRUE IDENTITY OF EACH NUMBER
+
+MISSION: You are a data detective assigned to identify and classify sensitive information. Your job is to examine each piece of evidence (JSON object) and determine its true nature — then **filter out unwanted types** before organizing the remainder into the Machine_Readable_Output database.
+
+⚠️ CRITICAL UPDATE:  
+You will receive input that has ALREADY been pre-processed and flagged.  
+→ **If `"to_drop": true`, SKIP that entry entirely — DO NOT include it in output.**  
+→ Only process entries where `"to_drop": false`.
+
+---
+
+EVIDENCE ANALYSIS PROTOCOL:
+
+1. DETERMINE THE TRUE IDENTITY (ONLY for entries with `"to_drop": false`):
+   - "national_id": Thai identification numbers (your top priority — but should be rare here due to pre-filtering)
+   - "full_pan": Complete payment card numbers (13-19 digits)
+   - "partial_pan": Incomplete payment card numbers (under 13 digits)
+   - "other": Everything else that doesn't fit above categories — **including prices, amounts, addresses, phone numbers, dates, reference IDs, etc.**
+
+2. CAPTURE THE TIMELINE:
+   - Extract the exact "start" and "end" timestamps from each evidence file
+
+3. CREATE IDENTITY PROFILE:
+   - national_id (8 digits): "Last 8 digits of Thai National ID"
+   - national_id (13-14 digits): "Thai National ID"
+   - full_pan (13-19 digits): "Full PAN"
+   - partial_pan (under 13 digits): "Partial PAN"
+   - other: "OTHER"
+
+4. FINAL FILTER — REMOVE THESE FROM OUTPUT:
+   → **ALL entries where `type = "national_id"`** (even if `"to_drop": false` — treat as fail-safe)  
+   → **ALL entries where `type = "other"`** — this includes (but not limited to):
+      - Prices (e.g., “500 baht”, “total 1,200”)
+      - Amounts (e.g., “3 units”, “quantity 5”)
+      - Addresses (e.g., “123 Sukhumvit Road”)
+      - Phone numbers (e.g., “081-234-5678”, “contact number is...”)
+      - Dates/times (e.g., “on 15 May”, “at 3 PM”)
+      - Reference numbers (e.g., “order #12345”, “ticket ID ABC789”)
+      - Any non-sensitive numeric or alphanumeric strings not matching PAN or national ID formats
+
+✅ **ONLY ALLOWED IN FINAL OUTPUT:**
+   - `"type": "full_pan"`
+   - `"type": "partial_pan"`
+
+🔶 **UNCERTAINTY CLAUSE (NEW):**  
+→ If you are **unsure** whether an entry qualifies as `"full_pan"` or `"partial_pan"` — **err on the side of inclusion**.  
+→ If context suggests it *might* be card-related (e.g., “the number on my card”, “digits for payment”, “card ending in...”) — classify as `partial_pan` or `full_pan` based on digit count and **KEEP IT**.  
+→ Only classify as `"other"` if you are **confident** it is non-card, non-ID (e.g., clearly a price, phone, address, or reference).  
+→ When in doubt — **PREFER TO KEEP. False negatives (dropping real PANs) are worse than false positives (keeping non-PANs).**
+
+---
+
+CASE FILE EXAMPLE:
+
+EVIDENCE SUBMITTED:
+{"id":1,"speaker":"Caller","context":"Caller provides the last eight digits of their national ID number for verification.","tags":["partial_pan"],"to_drop":false,"start":106.34,"end":114.94}
+{"id":2,"speaker":"Agent","context":"Agent reads back the full credit card number for confirmation.","tags":["CARD-RELATED","partial_pan"],"to_drop":false,"start":126.25,"end":132.33}
+{"id":3,"speaker":"Caller","context":"Caller provides 13-digit number (120714014573) in response to request for 'บัตรประชาชน' — confirmed as Thai National ID.","tags":["ID-VERIFICATION"],"to_drop":true,"start":322.25,"end":332.43}
+{"id":4,"speaker":"Caller","context":"My phone number is 081-234-5678 in case you need to call back.","tags":["CONTACT"],"to_drop":false,"start":400.10,"end":405.80}
+{"id":5,"speaker":"Agent","context":"The total amount due is 2,499 baht.","tags":["PRICE"],"to_drop":false,"start":410.20,"end":413.90}
+{"id":6,"speaker":"Caller","context":"I’ll use the card ending in 8877 for this payment.","tags":[],"to_drop":false,"start":500.00,"end":503.20}
+
+DETECTIVE'S ANALYSIS:
+- EVIDENCE #1:
+   * `"to_drop": false` → PROCESS
+   * Context indicates “national ID” → type = "national_id"
+   * → **REMOVE — national_id not allowed in final output**
+
+- EVIDENCE #2:
+   * `"to_drop": false` → PROCESS
+   * Context indicates “full credit card number” → type = "full_pan"
+   * → **KEEP — allowed type**
+
+- EVIDENCE #3:
+   * `"to_drop": true` → **SKIP ENTIRELY**
+
+- EVIDENCE #4:
+   * `"to_drop": false` → PROCESS
+   * Context indicates phone number → type = "other"
+   * → **REMOVE — “other” types excluded**
+
+- EVIDENCE #5:
+   * `"to_drop": false` → PROCESS
+   * Context indicates price → type = "other"
+   * → **REMOVE — “other” types excluded**
+
+- EVIDENCE #6:
+   * `"to_drop": false` → PROCESS
+   * Context: “card ending in 8877” — implies payment card, but only 4 digits → type = "partial_pan"
+   * → **KEEP — allowed type + uncertainty clause favors inclusion**
+
+SECURE STORAGE REPORT:
+<Machine_Readable_Output>
+[
+  {
+    "start": 126.25,
+    "end": 132.33,
+    "type": "full_pan",
+    "description": "Full PAN"
+  },
+  {
+    "start": 500.00,
+    "end": 503.20,
+    "type": "partial_pan",
+    "description": "Partial PAN"
+  }
+]
+</Machine_Readable_Output>
+
+---
+
+REPORTING REQUIREMENTS:
+- Submit ONLY the Machine_Readable_Output database in XML format
+- Include NO additional commentary or analysis
+- TERMINATE immediately after closing the Machine_Readable_Output tag
+- **DO NOT OUTPUT ANY ENTRY WHERE:**
+   - `"to_drop": true`
+   - `type = "national_id"`
+   - `type = "other"` (including prices, amounts, addresses, phone numbers, dates, reference IDs, etc.)
+- ✅ **WHEN UNSURE — CLASSIFY AS `partial_pan` OR `full_pan` AND KEEP. PREFER INCLUSION OVER EXCLUSION.**
+
+STANDARD REPORT FORMAT:
+<Machine_Readable_Output>
+[
+  {"start": 200.01, "end": 205.33, "type": "full_pan", "description": "Full PAN"},
+  {"start": 500.00, "end": 503.20, "type": "partial_pan", "description": "Partial PAN"}
+]
+</Machine_Readable_Output>
+
+REMEMBER: No additional text. No explanations. End mission after final database closure.
+
+ASSIGNED EVIDENCE:
+<JSON objects>
+${List_final}
+</JSON objects>

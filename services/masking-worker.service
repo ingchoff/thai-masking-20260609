@@ -1,0 +1,15 @@
+[Unit]
+Description=Audio Masking Worker Process
+After=network.target
+
+[Service]
+User=trbsysadmin
+Group=trbsysadmin
+WorkingDirectory=/home/trbsysadmin/git/thai-masking-20250722
+EnvironmentFile=/home/trbsysadmin/git/thai-masking-20250722/.env
+ExecStart=/home/trbsysadmin/.cargo/bin/uv run --env-file /home/trbsysadmin/git/thai-masking-20250722/.env worker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

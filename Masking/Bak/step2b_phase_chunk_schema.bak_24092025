@@ -1,0 +1,419 @@
+"""Step 2b of masking pipeline: Identify PAN segments."""
+import os
+import re
+import json5
+import sys
+import argparse
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
+from jamaibase import JamAI, protocol as p
+from jamaibase.exceptions import ResourceNotFoundError, JamaiException
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+# Initialize pipeline logger
+pipeline_logger = LOGGER.bind(type="pipeline", service_name="phase_chunk")
+
+# --- Configuration ---
+load_dotenv()
+
+# Constants
+PROJECT_ID = os.getenv("PROJECT_ID", "proj_f7d3c85dddfa84363ab29f4b")
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+TABLE_TYPE = p.TableType.action
+INPUT_TABLE_PREFIX = "step2_"
+OUTPUT_SCHEMA_TABLE_ID = "step2b"
+OUTPUT_TABLE_PREFIX = "step2b_"
+DEFAULT_FETCH_LIMIT = 100
+
+# Phase merge settings
+# read user settings once at import time
+PHASE_TARGET_SECONDS    = float(os.getenv("PHASE_TARGET_SECONDS", 50))
+
+def _safe_json(text: str) -> Any:
+    if not text:
+        return None
+    # 1. Try to extract <JSON>…</JSON> first
+    m = re.search(r"<JSON>([\s\S]*?)</JSON>", text, re.I)
+    payload = m.group(1) if m else text.strip()
+    # 2. Parse with JSON5
+    try:
+        return json5.loads(payload)
+    except Exception as e:
+        pipeline_logger.error(f"Failed to parse JSON: {m}, err: {str(e)}")
+        return None
+
+def overlap_len(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    """Compute overlap length between two time ranges."""
+    return min(a_end, b_end) - max(a_start, b_start)
+
+def is_overlap(a_start: float, a_end: float, b_start: float, b_end: float, epsilon: float = 0.5) -> bool:
+    """Check if two time ranges overlap, inclusive."""
+    return overlap_len(a_start, a_end, b_start, b_end) > -epsilon
+
+def _merge_phases(phases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Greedy merge: while current chunk < PHASE_TARGET_SECONDS keep eating next phase.
+    Last phase merged backward if still short.
+    """
+    if not phases:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    i, n = 0, len(phases)
+
+    while i < n:
+        cur = phases[i].copy()
+        idx_acc   = [cur["index"]]
+        phase_acc = [cur["phase"]]
+        desc_acc  = [cur["description"]]
+        start     = cur["start_time"]
+        end       = cur["end_time"]
+
+        # ---------- greedy forward merge ----------
+        while (end - start) < PHASE_TARGET_SECONDS and i + 1 < n:
+            nxt = phases[i + 1]
+            end = nxt["end_time"]
+            idx_acc.append(nxt["index"])
+            phase_acc.append(nxt["phase"])
+            desc_acc.append(nxt["description"])
+            i += 1
+
+        merged.append({
+            "index":       min(idx_acc),
+            "phase":       " & ".join(phase_acc),
+            "description": " & ".join(desc_acc),
+            "start_time":  start,
+            "end_time":    end
+        })
+        i += 1
+
+    # ---------- final fix: last chunk still short? merge backward ----------
+    if merged and (merged[-1]["end_time"] - merged[-1]["start_time"]) < PHASE_TARGET_SECONDS:
+        last = merged.pop()
+        if merged:                       # only merge if a previous chunk exists
+            prev = merged[-1]
+            prev["end_time"]    = last["end_time"]
+            prev["phase"]       = f"{prev['phase']} & {last['phase']}"
+            prev["description"] = f"{prev['description']} & {last['description']}"
+            prev["index"]       = min(prev["index"], last["index"])
+        else:
+            # solitary chunk – nothing to merge with, put it back
+            merged.append(last)
+
+    return merged
+
+def parse_timestamp_from_id(table_id: str, prefix: str) -> Optional[str]:
+    """Extracts YYYYMMDD_HHMMSS from table ID if it matches prefix.
+    
+    Args:
+        table_id: Full table ID to parse
+        prefix: Expected prefix before timestamp
+        
+    Returns:
+        Extracted timestamp string or None if invalid
+    """
+    if table_id.startswith(prefix):
+        timestamp_part = table_id[len(prefix):]
+        try:
+            datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
+            return timestamp_part
+        except ValueError:
+            return None
+    return None
+
+def merge_segments_and_words(rows: List[Dict]) -> Dict[str, List]:
+    segments_and_words_dict = defaultdict(list)
+    for row in rows:
+        file_path = row.get("file_path")
+        if file_path:
+            segments_and_words_dict[file_path].extend(_safe_json(row.get("SegmentsAndWords", "[]")))
+    return segments_and_words_dict
+
+def split_row_by_phases(record: Dict, segments: List) -> List[Dict]:
+    """
+    Break the input record into one mini-record per phase defined
+    in record['init']['phases'].
+
+    Each mini-record keeps:
+        - the original meta fields (ID, Updated at, file_path)
+        - only the Transcription lines and Segments whose time-range
+          overlaps the phase [start_time, end_time]
+    """
+    # 1) parse the phase table
+    init_block = _safe_json(record["init"])
+    if init_block is None:
+        pipeline_logger.error(f"Failed to parse init block from record: {record.get('init', 'N/A')}")
+        return []
+    
+    raw_phases = init_block.get("phases")
+    if raw_phases is None:
+        pipeline_logger.error(f"No 'phases' key found in init_block: {init_block}")
+        return []
+    
+    # merge phases
+    phases = _merge_phases(raw_phases)
+
+    # 2. parse transcription lines -> (start, end, raw_line)
+    trans_lines = []
+    for ln in record["Transcription"].splitlines():
+        m = re.match(r"\[([\d.]+)\s*-->\s*([\d.]+)\].*", ln)
+        if m:
+            trans_lines.append((float(m[1]), float(m[2]), ln))
+
+    # 3) build one mini-record per phase
+    out = []
+    last_phase = None
+    for phase in phases:
+        phase_start, phase_end = phase["start_time"], phase["end_time"]
+        # check if current phase and last phase has a large gap
+        # then set phase_start to last phase end
+        if last_phase:
+            if phase_start - last_phase["end_time"] > 1:
+                phase_start = last_phase["end_time"]
+                phase = phase.copy()
+                phase["start_time"] = phase_start
+        # transcription lines that overlap the phase
+        phase_trans = "\n".join(
+            raw for _start, _end, raw in trans_lines if is_overlap(_start, _end, phase_start, phase_end)
+        )
+        # segments whose corresponding line overlaps the phase
+        phase_segs = [
+            s for s in segments
+            if is_overlap(s["start"], s["end"], phase_start, phase_end)
+        ]
+        # only append result with phase_segs > 0 
+        if len(phase_segs) > 0:
+            mini = {
+                "file_path": record["file_path"],
+                "Transcription": phase_trans,
+                "SegmentsAndWords": json5.dumps(phase_segs, ensure_ascii=False),  # Store the phase segments as JSON
+                "init_phase": json5.dumps(phase, ensure_ascii=False),  # Store the original phase
+            }
+            out.append(mini)
+        # update last_phase
+        last_phase = phase
+    return out
+
+def get_data_from_input_table(jamai: JamAI, input_table_timestamp: str) -> List[Dict[str, Any]]:
+    """Sets up the output table by duplicating schema.
+    
+    Args:
+        jamai: Initialized JamAI client
+        input_table_timestamp: Timestamp string for output table naming
+        
+    Returns:
+        Input table data
+        
+    Raises:
+        JamaiException: If table operations fail
+    """
+    INPUT_TABLE_ID = f"{INPUT_TABLE_PREFIX}{input_table_timestamp}"
+    
+    # Delete existing output table if present
+    try:
+        input_table = jamai.table.get_table(table_type=TABLE_TYPE, table_id=INPUT_TABLE_ID)
+    except ResourceNotFoundError:
+        pipeline_logger.error(f"Input table '{INPUT_TABLE_ID}' not found.")
+        pass
+    
+    total_rows = input_table.num_rows
+    offset = 0
+    _row_num = 0
+    all_rows: list[dict[str, Any]] = []
+    while _row_num < total_rows:
+        limit = DEFAULT_FETCH_LIMIT
+        try:
+            rows = jamai.table.list_table_rows(
+                table_type=TABLE_TYPE,
+                table_id=input_table.id,
+                columns=["file_path", "Transcription", "SegmentsAndWords", "init"],
+                limit=limit,
+                offset=offset
+            )
+            offset += limit
+            _row_num += rows.total
+            all_rows = all_rows + rows.items
+            # _splited_rows = [_r for row in rows.items for _r in split_row_by_phases(row)]
+            # processed_rows.extend(_splited_rows)
+        except JamaiException as e:
+            if e.status_code == 404:
+                break
+            raise
+    
+    # merge the SegmentsAndWords based on same file path
+    segments_and_words_dict = merge_segments_and_words(all_rows)
+    
+    # process rows
+    processed_rows = []
+    # _phases_set is used to avoid duplicate process
+    _phases_set = set()
+    _phases_len = 0
+    for row in all_rows:
+        _phases_set.add(row["init"])
+        if len(_phases_set) == _phases_len:
+            continue
+        _phases_len = len(_phases_set)
+        _splited_rows = split_row_by_phases(row, segments_and_words_dict[row["file_path"]])
+        processed_rows.extend(_splited_rows)
+    
+    return processed_rows
+
+def setup_output_table(
+    jamai: JamAI,
+    input_table_timestamp: str,
+    output_schema_table_id: str = OUTPUT_SCHEMA_TABLE_ID
+) -> str:
+    """Sets up the output table by duplicating schema.
+    
+    Args:
+        jamai: Initialized JamAI client
+        input_table_timestamp: Timestamp string for output table naming
+        output_schema_table_id: Schema template table ID
+        
+    Returns:
+        ID of the created output table
+        
+    Raises:
+        JamaiException: If table operations fail
+    """
+    output_table_id = f"{OUTPUT_TABLE_PREFIX}{input_table_timestamp}"
+    
+    # Check if output schema exists
+    jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_schema_table_id)
+    
+    # Delete existing output table if present
+    try:
+        jamai.table.get_table(table_type=TABLE_TYPE, table_id=output_table_id)
+        jamai.table.delete_table(table_type=TABLE_TYPE, table_id=output_table_id)
+    except ResourceNotFoundError:
+        pass
+    
+    # Duplicate schema to new table
+    jamai.table.duplicate_table(
+        table_type=TABLE_TYPE,
+        table_id_src=output_schema_table_id,
+        table_id_dst=output_table_id,
+        include_data=False
+    )
+    
+    return output_table_id
+
+
+def add_rows_to_output_table(jamai: JamAI, output_table_id: str, rows: List[Dict[str, Any]]):
+    """Add rows to the output table.
+    
+    Args:
+        jamai: Initialized JamAI client
+        output_table_id: Output table ID
+        rows: Rows to add to the output table
+    """
+    batch_size = 100
+    
+    if len(rows) <= batch_size:
+        jamai.table.add_table_rows(
+            table_type=TABLE_TYPE,
+            request=p.RowAddRequest(
+                table_id=output_table_id,
+                data=rows,
+                stream=False,
+            )
+        )
+    else:
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            jamai.table.add_table_rows(
+                table_type=TABLE_TYPE,
+                request=p.RowAddRequest(
+                    table_id=output_table_id,
+                    data=batch,
+                    stream=False,
+                )
+            )
+
+def run_phase_chunk_step_pipeline(
+    input_table_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pipeline version of phase chunk step that returns structured results.
+    
+    Args:
+        input_table_id: Explicit table ID or None to auto-detect latest
+        row_limit: Max rows to process from input table
+        
+    Returns:
+        Dictionary with:
+        - table_id: ID of created output table
+        - stats: Processing statistics
+    """
+    try:
+        output_table_id = run_phase_chunk_step(
+            input_table_id=input_table_id,
+        )
+        return {
+            "table_id": output_table_id,
+            "stats": {
+                "status": "completed",
+                "message": "Successfully processed phase chunks"
+            }
+        }
+    except Exception as e:
+        return {
+            "table_id": None,
+            "stats": {
+                "status": "failed",
+                "message": str(e)
+            }
+        }
+    
+
+def run_phase_chunk_step(
+    input_table_id: Optional[str] = None,
+) -> str:
+    """Main function to process input table and create chunked output table.
+    
+    Args:
+        input_table_id: Explicit table ID or None to auto-detect latest
+        context_limit: Token limit for each segment chunk
+        
+    Returns:
+        ID of the created output table
+        
+    Raises:
+        JamaiException: For JamAI-specific errors
+        ValueError: For invalid inputs
+    """
+    jamai = JamAI(project_id=PROJECT_ID, api_base=JAMAI_API_BASE)
+    input_table_timestamp = parse_timestamp_from_id(input_table_id, INPUT_TABLE_PREFIX)
+    output_table_id = setup_output_table(jamai, input_table_timestamp)
+    pipeline_logger.info(f"Successfully created output table: {output_table_id}")
+    rows = get_data_from_input_table(jamai, input_table_timestamp)
+    add_rows_to_output_table(jamai, output_table_id, rows)
+    pipeline_logger.info(f"Successfully added {len(rows)} rows to output table: {output_table_id}")
+    return output_table_id
+
+def main():
+    """Command line interface for the script."""
+    parser = argparse.ArgumentParser(
+        description="Filter rows needing masking from input table and chunk segments."
+    )
+    parser.add_argument("--input-table", default=None, 
+                       help=f"Specify input table name (e.g., {INPUT_TABLE_PREFIX}YYYYMMDD_HHMMSS)")
+    parser.add_argument("--limit", type=int, default=None, 
+                       help="Limit total rows to process")
+    
+    args = parser.parse_args()
+    
+    try:
+        run_phase_chunk_step(
+            input_table_id=args.input_table,
+        )
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"Error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

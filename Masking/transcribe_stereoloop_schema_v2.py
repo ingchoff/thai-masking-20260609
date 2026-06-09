@@ -1,0 +1,651 @@
+# transcribe_stereoloop_schema_v2.py
+# Enhanced version using AdvDictTranscriptionClient for improved quality
+import os
+import json
+import time
+import numpy as np
+import concurrent.futures
+import re
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
+from jamaibase import JamAI, protocol as p
+from jamaibase.utils.exceptions import ResourceNotFoundError, JamaiException
+from dotenv import load_dotenv
+import traceback
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+try:
+    from Masking.jamai_utils import resolve_jamai_timeout
+except ImportError:
+    from jamai_utils import resolve_jamai_timeout
+
+# Initialize transcription logger
+transcription_logger = LOGGER.bind(type="pipeline", service_name="transcription")
+try:
+    # First try relative import (works when run as package)
+    from .special_dict_transcription import AdvDictTranscriptionClient
+except ImportError:
+    # Fall back to absolute import (works when run directly)
+    from special_dict_transcription import AdvDictTranscriptionClient
+
+# --- 1. Configuration ---
+load_dotenv()
+
+# --- Default Settings (can be overridden by env vars or args) ---
+DEFAULT_MODEL_PATH = os.getenv("MASKING_MODEL_ID", "/home/trbdevsysadmin/faster-whisper-th-large-v3-int8") # Default transcription model
+DEFAULT_API_URL = os.getenv("MASKING_API_URL", "http://localhost:28000/v1/audio/transcriptions") # Default transcription API
+DEFAULT_MAX_WORKERS = os.getenv("MASKING_MAX_WORKERS", 2) # Default parallel workers
+
+# --- JamAI Configuration ---
+PROJECT_ID = os.getenv("PROJECT_ID", "proj_f7d3c85dddfa84363ab29f4b") # Replace default if needed or set via env
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api") # Default JamAI API base
+JAMAI_TIMEOUT_SEC = resolve_jamai_timeout(logger=transcription_logger)
+TABLE_TYPE = p.TableType.ACTION
+SCHEMA_TABLE_ID = "step1" # The fixed name of the schema template table
+TARGET_TABLE_PREFIX = "step1_" # Prefix for the target table
+
+# --- 2. Default Runtime Values ---
+# These will be overridden when running as main script
+ROOT_DIR = None
+OUTPUT_DIR = None
+PROCESS_LIMIT = None
+MODEL_PATH = DEFAULT_MODEL_PATH
+API_URL = DEFAULT_API_URL
+MAX_WORKERS = int(DEFAULT_MAX_WORKERS)
+OUTPUT_SUFFIX = None
+TEXT_FORMAT = "range"
+SAVE_DEBUG = False
+WORD_THRESHOLD = 5.0
+NEW_TURN_THRESHOLD = 1.5
+DBFS_THRESHOLD = 6.0
+
+# --- 3. Helper Functions ---
+
+def clean_segments_for_token_optimization(segments):
+    """
+    Clean segments data to reduce token usage by removing specified keys.
+    
+    Removes from segments:
+    - seek, duration, word_count, char_count
+    
+    Removes from words:
+    - probability, channel
+    
+    Args:
+        segments: List of segment dictionaries
+        
+    Returns:
+        List of cleaned segment dictionaries
+    """
+    if not segments:
+        return []
+    
+    cleaned_segments = []
+    
+    for segment in segments:
+        # Create cleaned segment by excluding specified keys
+        cleaned_segment = {}
+        
+        # Copy all keys except the ones we want to remove
+        for key, value in segment.items():
+            if key not in ['seek', 'duration', 'word_count', 'char_count']:
+                if key == 'words' and isinstance(value, list):
+                    # Clean the words array
+                    cleaned_words = []
+                    for word in value:
+                        if isinstance(word, dict):
+                            # Copy word data excluding probability and channel
+                            cleaned_word = {k: v for k, v in word.items() 
+                                          if k not in ['probability', 'channel']}
+                            cleaned_words.append(cleaned_word)
+                        else:
+                            # Handle cases where word might be a string or other type
+                            cleaned_words.append(word)
+                    cleaned_segment[key] = cleaned_words
+                else:
+                    cleaned_segment[key] = value
+        
+        cleaned_segments.append(cleaned_segment)
+    
+    return cleaned_segments
+
+def find_audio_files(root_dir):
+    """Recursively finds all .wav or .mp3 files."""
+    audio_files = []
+    transcription_logger.info(f"Scanning for WAV/MP3 files in: {root_dir}")
+    if not os.path.isdir(root_dir):
+        transcription_logger.error(f"Input directory '{root_dir}' not found or is not a directory.")
+        return []
+    for subdir, _, files in os.walk(root_dir):
+        for file in files:
+            if file.lower().endswith(('.wav', '.mp3')):
+                full_path = os.path.join(subdir, file)
+                audio_files.append(full_path)
+    transcription_logger.info(f"Found {len(audio_files)} audio files.")
+    return audio_files
+
+def upload_to_jamai(file_path, data_to_upload, jamai_client, table_type, current_table_id):
+    """
+    Uploads final processed data (mono or stereo) to JamAI.
+    Compatible with enhanced transcription client output.
+    """
+    filename = os.path.basename(file_path)
+    try:
+        if not data_to_upload or 'segments' not in data_to_upload:
+            tqdm.write(f"✗ Cannot upload {filename} to JamAI: Invalid or no data provided.")
+            return False, "Invalid or no data to upload"
+        
+        is_stereo = data_to_upload.get("is_stereo_merged", False)
+        transcription_text = data_to_upload.get("text", "")
+        all_segments = data_to_upload.get("segments", [])
+        
+        # Prepare 'Segments' column (basic info)
+        segments_for_jamai = []
+        for seg in all_segments:
+            seg_basic = {k: seg.get(k) for k in ('id', 'start', 'end', 'text') if k in seg}
+            if is_stereo and 'channel' in seg: 
+                seg_basic['channel'] = seg.get('channel')
+            segments_for_jamai.append(seg_basic)
+        segments_json = json.dumps(segments_for_jamai, ensure_ascii=False) if segments_for_jamai else "[]"
+        
+        # Prepare 'SegmentsAndWords' column (optimized segment data with reduced tokens)
+        # Remove keys: seek, duration, word_count, char_count from segments
+        # Remove keys: probability, channel from words to save tokens
+        cleaned_segments = clean_segments_for_token_optimization(all_segments)
+        segments_words_json = json.dumps(cleaned_segments, ensure_ascii=False) if cleaned_segments else "[]"
+        
+        request_data = p.RowAddRequest(
+            table_id=current_table_id,
+            data=[dict(
+                file_path=str(file_path), # Store original file path
+                Transcription=transcription_text,
+                Segments=segments_json,
+                SegmentsAndWords=segments_words_json
+            )],
+            stream=False,
+        )
+        
+        response = jamai_client.table.add_table_rows(table_type=table_type, request=request_data)
+        # check row_id exists
+        if response and len(response.rows) > 0:
+            return True, None # Success
+        else:
+            tqdm.write(f"⚠ Warning: Upload {filename} completed but response unexpected: {response}")
+            return True, "Upload completed but response format unexpected"
+            
+    except JamaiException as e:
+        error_message = f"Failed to upload {filename} to JamAI table {current_table_id}: {e}"
+        tqdm.write(f"✗ {error_message}")
+        return False, error_message
+    except Exception as e:
+        error_message = f"Unexpected error uploading {filename} to JamAI table {current_table_id}: {str(e)}"
+        tqdm.write(f"✗ {error_message}")
+        transcription_logger.opt(exception=True).error(error_message)
+        return False, error_message
+
+# --- 4. Enhanced Processing Function ---
+def process_file_enhanced(audio_path, model_path, output_dir, jamai_client, transcription_client, table_type, current_table_id,
+                         text_format, save_debug):
+    """
+    Enhanced file processing using AdvDictTranscriptionClient.
+    Much simpler than the original while providing better quality.
+    """
+    filename = os.path.basename(audio_path)
+    safe_base_filename = re.sub(r'[\\/*?:"<>|]', "_", os.path.splitext(filename)[0])
+    
+    # Create output directories
+    os.makedirs(output_dir, exist_ok=True)
+    tmp_output_dir = os.path.join(output_dir, "tmp")
+    os.makedirs(tmp_output_dir, exist_ok=True)
+    
+    # Define cache path for final result
+    final_json_path = os.path.join(output_dir, f"{safe_base_filename}.json")
+    
+    # Status Codes (maintaining compatibility with original)
+    # 0: Success, 1: TranscribeFail, 3: UploadFail, 5: Skip, -1: Unexpected Error
+    try:
+        # Check if result already exists (caching)
+        if os.path.exists(final_json_path):
+            try:
+                with open(final_json_path, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                if cached_data and 'segments' in cached_data:
+                    tqdm.write(f"-> Using cached result for {filename}")
+                    # Upload cached result
+                    time.sleep(np.random.rand()) # randomise delay to add row
+                    upload_success, upload_error = upload_to_jamai(
+                        audio_path, cached_data, jamai_client, table_type, current_table_id
+                    )
+                    if upload_success:
+                        return audio_path, 0, f"Success (Cached)"
+                    else:
+                        return audio_path, 3, f"Upload failed: {upload_error}"
+            except Exception as e_cache:
+                tqdm.write(f"⚠ Warning: Could not load cached data for {filename}: {e_cache}")
+                # Continue with fresh processing
+        
+        # Process with enhanced client
+        tqdm.write(f"-> Processing {filename} with enhanced client...")
+        
+        result = transcription_client.process_audio(
+            model_name=model_path,
+            file_path=audio_path,
+            language_code="th",
+            output_format="both",
+            text_format=text_format,
+            save_debug=save_debug
+        )
+        
+        # Check if processing was successful
+        if isinstance(result, dict) and "json" in result:
+            # Extract the JSON data (which contains all the structured information)
+            final_data = result["json"]
+            
+            # Save final result to cache
+            try:
+                with open(final_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(final_data, f, ensure_ascii=False, indent=2)
+                tqdm.write(f"  ✓ Saved enhanced result to {os.path.basename(final_json_path)}")
+            except Exception as e_save:
+                tqdm.write(f"⚠ Warning: Could not save result cache for {filename}: {e_save}")
+                # Continue with upload even if cache save failed
+            
+            # Upload to JamAI
+            tqdm.write(f"  -> Uploading enhanced data for {filename}...")
+            upload_success, upload_error = upload_to_jamai(
+                audio_path, final_data, jamai_client, table_type, current_table_id
+            )
+            
+            if upload_success:
+                # Determine if stereo or mono for status message
+                is_stereo = final_data.get("is_stereo_merged", False)
+                processing_info = final_data.get("metadata", {}).get("processing_info", {})
+                rerun_info = " (Enhanced)" if processing_info.get("rerun_performed") else ""
+                return audio_path, 0, f"Success ({'Stereo' if is_stereo else 'Mono'}){rerun_info}"
+            else:
+                return audio_path, 3, f"Upload failed: {upload_error}"
+                
+        elif isinstance(result, str) and result.startswith("Error"):
+            # Enhanced client returned an error
+            return audio_path, 1, f"Enhanced transcription failed: {result}"
+        else:
+            # Unexpected result format
+            return audio_path, 1, f"Enhanced transcription returned unexpected format: {type(result)}"
+            
+    except Exception as exc:
+        tqdm.write(f"✗ UNEXPECTED ERROR processing {filename} with enhanced client: {exc}")
+        transcription_logger.opt(exception=True).error(f"UNEXPECTED ERROR processing {filename} with enhanced client: {exc}")
+        return audio_path, -1, f"Unexpected enhanced processing error: {exc}"
+
+def run_transcription_step_batch(
+    input_files: List[str],
+    jsondir: Optional[str] = None,
+    output_dirs: Optional[List[str]] = None,
+    jamai_client: Optional[JamAI] = None,
+    transcription_client: Optional[AdvDictTranscriptionClient] = None,
+    model_path: str = DEFAULT_MODEL_PATH,
+    api_url: str = DEFAULT_API_URL,
+    workers: int = int(DEFAULT_MAX_WORKERS),
+    output_suffix: Optional[str] = None,
+    text_format: str = "range",
+    save_debug: bool = False,
+    word_threshold: float = 5.0,
+    new_turn_threshold: float = 1.5,
+    dbfs_threshold: float = 6.0
+) -> Tuple[str, List[Dict]]:
+    """Core transcription logic extracted from current script.
+    Returns JamAI table ID of the created transcription table."""
+    
+    # Initialize transcription client (if not provided)
+    if transcription_client is None:
+        transcription_logger.info("Initializing Enhanced Transcription Client...")
+        try:
+            transcription_client = AdvDictTranscriptionClient(
+                api_url=api_url,
+                max_workers=workers
+            )
+            # Configure thresholds
+            transcription_client.DEFAULT_LONG_WORD_THRESHOLD = word_threshold
+            transcription_client.DEFAULT_NEW_TURN_THRESHOLD = new_turn_threshold
+            transcription_client.DEFAULT_DBFS_THRESHOLD = dbfs_threshold
+            transcription_logger.info(f"Enhanced client initialized with improved quality processing")
+            transcription_logger.info(f"Word threshold: {word_threshold}s, Turn threshold: {new_turn_threshold}s, dBFS threshold: {dbfs_threshold}dB")
+        except Exception as e:
+            transcription_logger.error(f"FATAL ERROR: Failed to initialize enhanced transcription client: {e}")
+            traceback.print_exc()
+            raise
+    else:
+        transcription_logger.info("Using provided Enhanced Transcription Client...")
+
+    # Initialize JamAI (if not provided)
+    if jamai_client is None:
+        transcription_logger.info("Initializing JamAI Client...")
+        try:
+            jamai = JamAI(
+                project_id=PROJECT_ID,
+                api_base=JAMAI_API_BASE,
+                timeout=JAMAI_TIMEOUT_SEC,
+            )
+            transcription_logger.info(f"Client Initialized. Project ID: {jamai.project_id}, API Base: {jamai.api_base}")
+        except Exception as e:
+            transcription_logger.opt(exception=True).error(f"Failed to initialize JamAI client: {e}")
+            raise
+    else:
+        transcription_logger.info("Using provided JamAI Client...")
+        jamai = jamai_client
+
+    # Setup JamAI table
+    active_table_id = None
+    transcription_logger.info(f"\n--- Checking JamAI Table Status using Schema Table '{SCHEMA_TABLE_ID}' ---")
+    try:
+        # Check schema template
+        transcription_logger.info(f'Checking for schema template table: "{SCHEMA_TABLE_ID}"...')
+        jamai.table.get_table(table_type=TABLE_TYPE, table_id=SCHEMA_TABLE_ID)
+        transcription_logger.info(f"Schema template table '{SCHEMA_TABLE_ID}' found.")
+        
+        # Generate target table name
+        if output_suffix:
+            target_table_id = f"{TARGET_TABLE_PREFIX}{output_suffix}"
+            transcription_logger.info(f"Using provided suffix. Target table name for this run: '{target_table_id}'")
+        else:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target_table_id = f"{TARGET_TABLE_PREFIX}{timestamp_str}"
+            transcription_logger.info(f"Using timestamp suffix. Target table name for this run: '{target_table_id}'")
+        
+        # Check and delete existing target table
+        transcription_logger.info(f"Checking if target table '{target_table_id}' already exists...")
+        try:
+            jamai.table.get_table(table_type=TABLE_TYPE, table_id=target_table_id)
+            transcription_logger.info(f"Target table '{target_table_id}' found. Deleting it first...")
+            jamai.table.delete_table(table_type=TABLE_TYPE, table_id=target_table_id)
+            transcription_logger.info(f"Deleted existing target table '{target_table_id}'.")
+        except ResourceNotFoundError:
+            transcription_logger.info(f"Target table '{target_table_id}' does not exist. Will create.")
+        
+        # Duplicate schema
+        transcription_logger.info(f"Attempting to duplicate schema from '{SCHEMA_TABLE_ID}' to '{target_table_id}' (without data)...")
+        jamai.table.duplicate_table(
+            table_type=TABLE_TYPE,
+            table_id_src=SCHEMA_TABLE_ID,
+            table_id_dst=target_table_id,
+            include_data=False
+        )
+        transcription_logger.info(f"Successfully created '{target_table_id}' by duplicating schema.")
+        active_table_id = target_table_id
+        
+    except Exception as e:
+        transcription_logger.opt(exception=True).error(f"FATAL ERROR during JamAI table operations: {e}")
+        raise
+
+    transcription_logger.info(f"--- Using JamAI Table ID for uploads: '{active_table_id}' ---")
+
+    # Validate output directory parameters
+    if jsondir and output_dirs:
+        raise ValueError("Cannot specify both jsondir and output_dirs")
+    if not (jsondir or output_dirs):
+        raise ValueError("Must specify either jsondir or output_dirs")
+    if output_dirs and len(input_files) != len(output_dirs):
+        raise ValueError("input_files and output_dirs must have same length")
+
+    # Process files
+    results = []
+    futures_map = {}
+    task_results = []
+    total_files_to_process = len(input_files)
+
+    transcription_logger.info(f"\nStarting enhanced processing for {total_files_to_process} files using table '{active_table_id}' with {workers} workers...")
+    transcription_logger.info(f"Enhanced Features:")
+    transcription_logger.info(f"  Text Format: {text_format}")
+    transcription_logger.info(f"  Save Debug: {save_debug}")
+    transcription_logger.info(f"  Word Threshold: {word_threshold}s")
+    transcription_logger.info(f"  Turn Threshold: {new_turn_threshold}s")
+    transcription_logger.info(f"  dBFS Threshold: {dbfs_threshold}dB")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for i, audio_path in enumerate(input_files):
+            # Determine output directory
+            output_dir = output_dirs[i] if output_dirs else jsondir
+            
+            future = executor.submit(
+                process_file_enhanced,
+                audio_path, model_path, output_dir,
+                jamai, transcription_client, TABLE_TYPE, active_table_id,
+                text_format, save_debug
+            )
+            futures_map[future] = (audio_path, output_dir)
+
+        # Progress bar and result collection
+        for future in tqdm(concurrent.futures.as_completed(futures_map), total=total_files_to_process, desc="Enhanced Processing"):
+            try:
+                audio_path, output_dir = futures_map[future]
+                audio_path_done = audio_path  # Keep for backward compatibility
+                result = future.result() # (audio_path, status_code, message)
+                results.append(result)
+                status_code, message = result[1], result[2]
+                
+                # Store detailed result
+                task_results.append({
+                    'input_path': audio_path,
+                    'output_dir': output_dir,
+                    'status': 'success' if status_code == 0 else 'failed',
+                    'error': message if status_code != 0 else None
+                })
+                
+                if status_code != 0:
+                    tqdm.write(f"✗ ERROR ({os.path.basename(audio_path)}): {message} (Code: {status_code})")
+            except Exception as exc:
+                audio_path, output_dir = futures_map[future]
+                filename_done = os.path.basename(audio_path)
+                error_msg = f"Exception during enhanced processing for {filename_done}: {exc}"
+                tqdm.write(f"✗ FATAL TASK ERROR ({filename_done}): {error_msg}")
+                transcription_logger.opt(exception=True).error(error_msg)
+                results.append((audio_path, -1, error_msg))
+                task_results.append({
+                    'input_path': audio_path,
+                    'output_dir': output_dir,
+                    'status': 'failed',
+                    'error': error_msg
+                })
+
+    transcription_logger.info("\n--- Enhanced Processing Complete ---")
+    
+    # Summarize results
+    success_count = sum(1 for r in results if r[1] == 0)
+    transcription_fails = sum(1 for r in results if r[1] == 1)
+    upload_fails = sum(1 for r in results if r[1] == 3)
+    task_exceptions = sum(1 for r in results if r[1] == -1)
+    
+    enhanced_count = sum(1 for r in results if r[1] == 0 and "(Enhanced)" in r[2])
+    cached_count = sum(1 for r in results if r[1] == 0 and "(Cached)" in r[2])
+
+    transcription_logger.info(f"Total files processed: {total_files_to_process}")
+    transcription_logger.info(f"Successfully processed & uploaded to '{active_table_id}': {success_count}")
+    transcription_logger.info(f"  - With enhanced quality corrections: {enhanced_count}")
+    transcription_logger.info(f"  - From cache: {cached_count}")
+    transcription_logger.info(f"Failures:")
+    if transcription_fails > 0: 
+        transcription_logger.info(f"  - Enhanced Transcription: {transcription_fails}")
+    if upload_fails > 0: 
+        transcription_logger.info(f"  - Upload: {upload_fails}")
+    if task_exceptions > 0: 
+        transcription_logger.info(f"  - Task Execution Error: {task_exceptions}")
+    
+    transcription_logger.info(f"\n🎉 Enhanced processing complete! Quality improvements applied automatically.")
+    
+    return active_table_id, task_results
+
+def main():
+    audio_files_to_process = find_audio_files(ROOT_DIR)
+    if not audio_files_to_process:
+        transcription_logger.error("No WAV or MP3 files found. Exiting.")
+        return
+
+    total_found = len(audio_files_to_process)
+
+    # Apply limit
+    if PROCESS_LIMIT is not None and PROCESS_LIMIT > 0:
+        if PROCESS_LIMIT < total_found:
+            transcription_logger.info(f"Limiting processing to the first {PROCESS_LIMIT} files (out of {total_found}).")
+            audio_files_to_process = audio_files_to_process[:PROCESS_LIMIT]
+        else: 
+            transcription_logger.info(f"Limit ({PROCESS_LIMIT}) >= files found ({total_found}). Processing all.")
+    elif PROCESS_LIMIT is not None and PROCESS_LIMIT <= 0:
+        transcription_logger.info("Limit is 0 or negative. No files will be processed.")
+        audio_files_to_process = []
+    else: 
+        transcription_logger.info(f"Processing all {total_found} files found.")
+
+    if not audio_files_to_process: 
+        transcription_logger.error("No files selected. Exiting.")
+        return
+
+    # Create output dir
+    if not os.path.exists(OUTPUT_DIR):
+        try: 
+            os.makedirs(OUTPUT_DIR)
+            transcription_logger.info(f"Created output directory: {OUTPUT_DIR}")
+        except OSError as e: 
+            transcription_logger.error(f"Error creating output directory {OUTPUT_DIR}: {e}")
+            return
+
+    # --- Initialize clients once in main() ---
+    # 1. Initialize JamAI Client
+    transcription_logger.info("Initializing JamAI Client...")
+    try:
+        jamai_client = JamAI(
+            project_id=PROJECT_ID,
+            api_base=JAMAI_API_BASE,
+            timeout=JAMAI_TIMEOUT_SEC,
+        )
+        transcription_logger.info(f"JamAI Client Initialized. Project ID: {jamai_client.project_id}, API Base: {jamai_client.api_base}")
+    except JamaiException as e:
+        transcription_logger.error(f"FATAL ERROR: Failed to initialize JamAI client: {e}")
+        sys.exit(1)
+    except Exception as e:
+        transcription_logger.opt(exception=True).error(f"FATAL ERROR: An unexpected error occurred during JamAI initialization: {e}")
+        sys.exit(1)
+
+    # 2. Initialize Enhanced Transcription Client
+    transcription_logger.info("\nInitializing Enhanced Transcription Client...")
+    try:
+        transcription_client = AdvDictTranscriptionClient(
+            api_url=API_URL,
+            max_workers=MAX_WORKERS
+        )
+        # Configure thresholds
+        transcription_client.DEFAULT_LONG_WORD_THRESHOLD = WORD_THRESHOLD
+        transcription_client.DEFAULT_NEW_TURN_THRESHOLD = NEW_TURN_THRESHOLD
+        transcription_client.DEFAULT_DBFS_THRESHOLD = DBFS_THRESHOLD
+        transcription_logger.info(f"Enhanced client initialized with improved quality processing")
+        transcription_logger.info(f"Word threshold: {WORD_THRESHOLD}s, Turn threshold: {NEW_TURN_THRESHOLD}s, dBFS threshold: {DBFS_THRESHOLD}dB")
+    except Exception as e:
+        transcription_logger.opt(exception=True).error(f"FATAL ERROR: Failed to initialize enhanced transcription client: {e}")
+        sys.exit(1)
+
+    # Run transcription step
+    try:
+        table_id = run_transcription_step_batch(
+            input_files=audio_files_to_process,
+            jsondir=OUTPUT_DIR,
+            jamai_client=jamai_client,
+            transcription_client=transcription_client,
+            model_path=MODEL_PATH,
+            api_url=API_URL,
+            workers=MAX_WORKERS,
+            output_suffix=OUTPUT_SUFFIX,
+            text_format=TEXT_FORMAT,
+            save_debug=SAVE_DEBUG,
+            word_threshold=WORD_THRESHOLD,
+            new_turn_threshold=NEW_TURN_THRESHOLD,
+            dbfs_threshold=DBFS_THRESHOLD
+        )
+        transcription_logger.info(f"\nFinal JamAI table with results: {table_id}")
+    except Exception as e:
+        transcription_logger.opt(exception=True).error(f"Error running transcription step: {e}")
+        sys.exit(1)
+
+def run_transcription_step_pipeline(tasks: List[Dict]) -> Dict:
+    """
+    Pipeline-specific interface that meets 3.5.4 requirements
+    
+    Args:
+        tasks: List of task dictionaries with:
+            - taskId
+            - trackId
+            - srcPath
+            - destPath
+            
+    Returns:
+        Dictionary with:
+        - tasks: Updated task list with status
+        - table_id: Created JamAI table ID
+        - stats: Processing statistics
+    """
+    # Call batch function with per-task output directories
+    table_id, file_results = run_transcription_step_batch(
+        input_files=[t['srcPath'] for t in tasks],
+        output_dirs=[t['destPath'] for t in tasks],
+        # Use default parameters or pass from tasks if needed
+    )
+    
+    # Map file results back to tasks
+    for task, file_result in zip(tasks, file_results):
+        task.update({
+            'status': file_result['status'],
+            'error': file_result.get('error'),
+            'table_id': table_id
+        })
+    
+    # Calculate statistics
+    success_count = sum(1 for t in tasks if t['status'] == 'success')
+    
+    return {
+        'tasks': tasks,
+        'table_id': table_id,
+        'stats': {
+            'total': len(tasks),
+            'successful': success_count,
+            'failed': len(tasks) - success_count
+        }
+    }
+
+if __name__ == "__main__":
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="Transcribe audio files using enhanced AdvDictTranscriptionClient and upload results to JamAI.")
+    parser.add_argument("--input", required=True, help="Root directory containing WAV/MP3 files (recursive search). Example: /PATH/CSH_CS")
+    parser.add_argument("--jsondir", required=True, help="Directory to save/load cached JSON transcription results. Example: /path/to/transcription_cache")
+    parser.add_argument("--limit", type=int, default=None, help="Limit the number of audio files to process. Default: process all found files.")
+    parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help=f"Path or identifier for the transcription model. Default: {DEFAULT_MODEL_PATH}")
+    parser.add_argument("--apiurl", default=DEFAULT_API_URL, help=f"URL of the transcription API. Default: {DEFAULT_API_URL}")
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS, help=f"Number of parallel workers for transcription/upload. Default: {DEFAULT_MAX_WORKERS}")
+    parser.add_argument("--output-suffix", default=None, help=f"Custom suffix for the output table name (e.g., 'MyRun'). If provided, the table will be named '{TARGET_TABLE_PREFIX}<suffix>'. If omitted, a timestamp (YYYYMMDD_HHMMSS) will be used.")
+    # Enhanced client arguments
+    parser.add_argument("--text-format", default="range", choices=["simple", "timestamped", "range", "srt", "detailed"], help="Text format for output (default: simple)")
+    parser.add_argument("--save-debug", action='store_true', help="Save debug files from enhanced transcription client")
+    parser.add_argument("--word-threshold", type=float, default=5.0, help="Word threshold for enhanced client (default: 5.0)")
+    parser.add_argument("--new-turn-threshold", type=float, default=1.5, help="Speaker turn threshold for enhanced client (default: 1.5)")
+    parser.add_argument("--dbfs-threshold", type=float, default=6.0, help="dBFS threshold for enhanced client (default: 6.0)")
+
+    args = parser.parse_args()
+
+    # Set global variables from args
+    ROOT_DIR = args.input
+    OUTPUT_DIR = args.jsondir
+    PROCESS_LIMIT = args.limit
+    MODEL_PATH = args.model
+    API_URL = args.apiurl
+    MAX_WORKERS = args.workers
+    OUTPUT_SUFFIX = args.output_suffix
+    TEXT_FORMAT = args.text_format
+    SAVE_DEBUG = args.save_debug
+    WORD_THRESHOLD = args.word_threshold
+    NEW_TURN_THRESHOLD = args.new_turn_threshold
+    DBFS_THRESHOLD = args.dbfs_threshold
+
+    main()

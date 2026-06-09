@@ -1,0 +1,1520 @@
+# special_dict_transcription.py
+import os
+import requests
+import json
+import time
+import concurrent.futures
+import re
+import sys
+import traceback
+import subprocess
+import tempfile
+from pydub import AudioSegment
+from pydub.exceptions import CouldntDecodeError
+import math
+import copy
+from datetime import datetime
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+try:
+    from Masking.postprocess_thai import ThaiTranscriptCleaner
+except ImportError:
+    from postprocess_thai import ThaiTranscriptCleaner
+
+special_dict_transcription_logger = LOGGER.bind(type="pipeline", service_name="special_dict_transcription")
+
+
+class TextFormatter:
+    """Handles various text formatting options for transcription output."""
+    
+    @staticmethod
+    def generate_simple_text(segments, is_stereo=False):
+        """Generate clean conversation text without timestamps."""
+        parts = []
+        for segment in segments:
+            text = segment.get("text", "").strip()
+            if text:
+                if is_stereo:
+                    channel = segment.get("channel", "Unknown")
+                    parts.append(f"[{channel}]: {text}")
+                else:
+                    parts.append(text)
+        return "\n".join(parts)
+    
+    @staticmethod
+    def generate_detailed_text(segments, format_type="timestamp_speaker", is_stereo=False):
+        """Generate detailed text with various formatting options."""
+        parts = []
+        for segment in segments:
+            text = segment.get("text", "").strip()
+            if not text:
+                continue
+                
+            start_time = segment.get("start", 0.0)
+            end_time = segment.get("end", 0.0)
+            
+            if format_type == "timestamp_speaker":
+                # Format: [00:12.34] [Speaker]: Text
+                timestamp = f"[{TextFormatter._format_timestamp(start_time)}]"
+                if is_stereo:
+                    channel = segment.get("channel", "Unknown")
+                    parts.append(f"{timestamp} [{channel}]: {text}")
+                else:
+                    parts.append(f"{timestamp} {text}")
+            elif format_type == "range_speaker":
+                # Format: [00:12.34 --> 00:15.67] [Speaker]: Text
+                start_ts = TextFormatter._format_timestamp(start_time)
+                end_ts = TextFormatter._format_timestamp(end_time)
+                timestamp = f"[{start_ts} --> {end_ts}]"
+                if is_stereo:
+                    channel = segment.get("channel", "Unknown")
+                    parts.append(f"{timestamp} [{channel}]: {text}")
+                else:
+                    parts.append(f"{timestamp} {text}")
+            elif format_type == "speaker_time":
+                # Format: [Speaker 00:12.34]: Text
+                if is_stereo:
+                    channel = segment.get("channel", "Unknown")
+                    timestamp = TextFormatter._format_timestamp(start_time)
+                    parts.append(f"[{channel} {timestamp}]: {text}")
+                else:
+                    timestamp = TextFormatter._format_timestamp(start_time)
+                    parts.append(f"[{timestamp}]: {text}")
+            elif format_type == "srt":
+                # SRT subtitle format
+                start_ts = TextFormatter._format_timestamp_srt(start_time)
+                end_ts = TextFormatter._format_timestamp_srt(end_time)
+                if is_stereo:
+                    channel = segment.get("channel", "Unknown")
+                    formatted_text = f"[{channel}]: {text}"
+                else:
+                    formatted_text = text
+                parts.append(f"{start_ts} --> {end_ts}\n{formatted_text}")
+                
+        return "\n".join(parts)
+    
+    @staticmethod
+    def _format_timestamp(seconds, format_type="seconds"):
+        """Format timestamp in various formats."""
+        if format_type == "seconds":
+            return f"{seconds:.2f}"
+        elif format_type == "mmss":
+            minutes = int(seconds // 60)
+            secs = seconds % 60
+            return f"{minutes:02d}:{secs:05.2f}"
+        elif format_type == "hhmmss":
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = seconds % 60
+            return f"{hours:02d}:{minutes:02d}:{secs:05.2f}"
+        else:
+            return f"{seconds:.2f}"
+    
+    @staticmethod
+    def _format_timestamp_srt(seconds):
+        """Format timestamp in SRT format (HH:MM:SS,mmm)."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        milliseconds = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+class JSONStructurer:
+    """Handles creation of comprehensive JSON output structures."""
+    
+    @staticmethod
+    def create_comprehensive_json(processed_data, audio_info=None, processing_stats=None):
+        """Create a rich JSON structure with all available data."""
+        # Base structure from processed data
+        json_structure = {
+            "text": processed_data.get("text", ""),
+            "simple_text": "",  # Will be populated
+            "segments": processed_data.get("segments", []),
+            "words": processed_data.get("words", []),
+            "metadata": {
+                "is_stereo_merged": processed_data.get("is_stereo_merged", False),
+                "language": processed_data.get("language", ""),
+                "duration": processed_data.get("duration", 0.0),
+                "processing_info": processing_stats or {},
+                "audio_info": audio_info or {},
+                "generated_at": datetime.now().isoformat(),
+                "format_version": "1.0"
+            }
+        }
+        
+        # Generate simple text version
+        is_stereo = json_structure["metadata"]["is_stereo_merged"]
+        json_structure["simple_text"] = TextFormatter.generate_simple_text(
+            json_structure["segments"], is_stereo
+        )
+        
+        # Enhance segments with additional metadata
+        JSONStructurer._enhance_segments(json_structure["segments"])
+        
+        # Ensure words list is populated if missing
+        if not json_structure["words"] and json_structure["segments"]:
+            json_structure["words"] = JSONStructurer._extract_words_from_segments(
+                json_structure["segments"]
+            )
+        
+        return json_structure
+    
+    @staticmethod
+    def _enhance_segments(segments):
+        """Add additional metadata to segments."""
+        for segment in segments:
+            # Add duration
+            start = segment.get("start", 0.0)
+            end = segment.get("end", 0.0)
+            segment["duration"] = end - start
+            
+            # Add word count
+            words = segment.get("words", [])
+            segment["word_count"] = len(words)
+            
+            # Add character count
+            text = segment.get("text", "")
+            segment["char_count"] = len(text)
+    
+    @staticmethod
+    def _extract_words_from_segments(segments):
+        """Extract all words from segments into a chronological list."""
+        all_words = []
+        for segment in segments:
+            words = segment.get("words", [])
+            for word in words:
+                word_copy = copy.deepcopy(word)
+                # Add channel info if available
+                if "channel" in segment:
+                    word_copy["channel"] = segment["channel"]
+                all_words.append(word_copy)
+        
+        # Sort by start time
+        all_words.sort(key=lambda w: w.get("start", 0.0))
+        return all_words
+
+
+class OutputManager:
+    """Manages different output formats and response structures."""
+    
+    @staticmethod
+    def format_response(processed_data, output_format="both", text_format="simple", 
+                       include_timestamps=True, include_confidence=False,
+                       audio_info=None, processing_stats=None):
+        """Create the appropriate response based on requested format."""
+        
+        is_stereo = processed_data.get("is_stereo_merged", False)
+        segments = processed_data.get("segments", [])
+        
+        # Generate text output
+        if text_format == "simple":
+            text_output = TextFormatter.generate_simple_text(segments, is_stereo)
+        elif text_format == "detailed":
+            format_type = "timestamp_speaker" if include_timestamps else "speaker_time"
+            text_output = TextFormatter.generate_detailed_text(segments, format_type, is_stereo)
+        elif text_format == "timestamped":
+            text_output = TextFormatter.generate_detailed_text(segments, "timestamp_speaker", is_stereo)
+        elif text_format == "range":
+            text_output = TextFormatter.generate_detailed_text(segments, "range_speaker", is_stereo)
+        elif text_format == "srt":
+            text_output = TextFormatter.generate_detailed_text(segments, "srt", is_stereo)
+        else:
+            text_output = TextFormatter.generate_simple_text(segments, is_stereo)
+        
+        # Generate JSON output
+        json_output = JSONStructurer.create_comprehensive_json(
+            processed_data, audio_info, processing_stats
+        )
+        
+        # Override the text in JSON with the formatted version
+        json_output["text"] = text_output
+        
+        # Return based on requested format
+        if output_format == "text":
+            return text_output
+        elif output_format == "json":
+            return json_output
+        elif output_format == "both":
+            return {
+                "text": text_output,
+                "json": json_output
+            }
+        else:
+            # Default to both
+            return {
+                "text": text_output,
+                "json": json_output
+            }
+
+
+class AdvDictTranscriptionClient:
+    """
+    Enhanced transcription client that provides both simple text and comprehensive JSON output.
+    This client builds upon the quality improvements of AdvTranscriptionClient while
+    providing rich structured data access for advanced applications.
+    """
+
+    # --- Constants (can be overridden on an instance) ---
+    LEFT_CHANNEL_LABEL = "Agent"
+    RIGHT_CHANNEL_LABEL = "Caller"
+    AMBIGUOUS_CHANNEL_LABEL = "Unknown"
+    # --- Re-run Configuration ---
+    DEFAULT_LONG_WORD_THRESHOLD = 5.0
+    DEFAULT_LONG_GAP_THRESHOLD = 13.0
+    DEFAULT_RERUN_PADDING = 0.3
+    DEFAULT_NEW_TURN_THRESHOLD = 1.5
+    DEFAULT_DBFS_THRESHOLD = 6.0
+    # --- Preprocessing Configuration ---
+    PREPROCESS_SAMPLE_RATE = 16000
+    PREPROCESS_CODEC = "pcm_s16le"
+    PREPROCESS_CHANNELS = 1
+
+    def __init__(self, api_url: str, api_key: str = None, max_workers: int = 2):
+        """
+        Initializes the AdvDictTranscriptionClient.
+        Args:
+            api_url (str): The URL of the transcription API endpoint.
+            api_key (str, optional): The API key for authentication. Defaults to None.
+            max_workers (int, optional): Number of parallel workers for concurrent tasks. Defaults to 2.
+        """
+        if not api_url:
+            raise ValueError("api_url must be provided.")
+        self.api_url = api_url
+        self.api_key = api_key
+        self.max_workers = max_workers
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        )
+        self.cleaner = ThaiTranscriptCleaner()
+        special_dict_transcription_logger.info("Initializing AdvDictTranscriptionClient...")
+        self._check_ffmpeg_tools()
+
+    def _check_ffmpeg_tools(self):
+        """Checks if ffmpeg and ffprobe are accessible."""
+        try:
+            subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=5,
+            )
+            subprocess.run(
+                ["ffprobe", "-version"],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=5,
+            )
+            special_dict_transcription_logger.info("✓ ffmpeg and ffprobe found.")
+        except (
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as e:
+            special_dict_transcription_logger.error(
+                "✗ FATAL ERROR: ffmpeg/ffprobe not found or not executable. Please install ffmpeg and ensure it's in your system's PATH."
+            )
+            raise RuntimeError(f"ffmpeg/ffprobe not found: {e}") from e
+
+    def process_audio(
+        self,
+        model_name: str,
+        file_path: str,
+        language_code: str,
+        output_format: str = "both",
+        text_format: str = "simple",
+        include_timestamps: bool = True,
+        include_confidence: bool = False,
+        save_debug: bool = True
+    ):
+        """
+        Processes a single audio file through the enhanced transcription pipeline.
+        
+        Args:
+            model_name (str): The name/path of the transcription model to use.
+            file_path (str): The path to the audio file (.wav or .mp3).
+            language_code (str): The language code for transcription (e.g., 'th').
+            output_format (str): Output format - "text", "json", or "both" (default).
+            text_format (str): Text formatting - "simple", "detailed", "timestamped", "range", "srt".
+            include_timestamps (bool): Whether to include timestamps in detailed formats.
+            include_confidence (bool): Whether to include confidence scores (if available).
+            save_debug (bool): Whether to save debug JSON files.
+        
+        Returns:
+            dict|str: Depending on output_format:
+                - "text": Returns formatted text string
+                - "json": Returns comprehensive JSON structure
+                - "both": Returns {"text": str, "json": dict}
+        """
+        if not os.path.exists(file_path):
+            error_msg = f"Error: File not found at '{file_path}'"
+            return error_msg if output_format == "text" else {"error": error_msg}
+        
+        try:
+            # Create debug directory if requested
+            temp_dir = None
+            if save_debug:
+                DEBUG_ROOT_DIR = "transcription_debug_output"
+                os.makedirs(DEBUG_ROOT_DIR, exist_ok=True)
+                file_basename = os.path.basename(file_path).rsplit(".", 1)[0]
+                temp_dir = os.path.join(
+                    DEBUG_ROOT_DIR, f"{file_basename}_{int(time.time())}"
+                )
+                os.makedirs(temp_dir, exist_ok=True)
+                special_dict_transcription_logger.info(f"\n--- Processing {os.path.basename(file_path)} in debug dir: {temp_dir} ---")
+            else:
+                temp_dir = tempfile.mkdtemp()
+                special_dict_transcription_logger.info(f"\n--- Processing {os.path.basename(file_path)} ---")
+            
+            # Initialize processing statistics
+            processing_stats = {
+                "start_time": time.time(),
+                "correction_passes": 0,
+                "issues_detected": 0,
+                "issues_fixed": 0,
+                "rerun_performed": False
+            }
+            
+            # Process the file
+            final_json_result = self._process_file_logic(
+                model_name, file_path, language_code, temp_dir, processing_stats
+            )
+            
+            processing_stats["end_time"] = time.time()
+            processing_stats["total_duration"] = processing_stats["end_time"] - processing_stats["start_time"]
+            
+            if final_json_result and "text" in final_json_result:
+                special_dict_transcription_logger.info(f"✓ Successfully processed {os.path.basename(file_path)}.")
+                
+                # Get audio info
+                audio_info = self._detect_audio_format(file_path)
+                
+                # Generate enhanced output
+                result = OutputManager.format_response(
+                    final_json_result,
+                    output_format=output_format,
+                    text_format=text_format,
+                    include_timestamps=include_timestamps,
+                    include_confidence=include_confidence,
+                    audio_info=audio_info,
+                    processing_stats=processing_stats
+                )
+                
+                # Save final result if debug mode
+                if save_debug and temp_dir:
+                    try:
+                        final_output_path = os.path.join(temp_dir, "final_enhanced_output.json")
+                        with open(final_output_path, 'w', encoding='utf-8') as f:
+                            if output_format == "text":
+                                json.dump({"text": result}, f, indent=2, ensure_ascii=False)
+                            elif output_format == "json":
+                                json.dump(result, f, indent=2, ensure_ascii=False)
+                            else:
+                                json.dump(result, f, indent=2, ensure_ascii=False)
+                        special_dict_transcription_logger.info(f"✓ Saved final enhanced output to {final_output_path}")
+                    except Exception as e:
+                        special_dict_transcription_logger.warning(f"⚠ Warning: Could not save final enhanced output: {e}")
+                
+                return result
+            else:
+                error_msg = (
+                    final_json_result.get("error", "Unknown processing error.")
+                    if isinstance(final_json_result, dict)
+                    else "Processing failed to produce a result."
+                )
+                special_dict_transcription_logger.error(f"✗ Failed to process {os.path.basename(file_path)}: {error_msg}")
+                return error_msg if output_format == "text" else {"error": error_msg}
+                
+        except Exception as e:
+            special_dict_transcription_logger.opt(exception=True).error(f"✗ An unexpected exception occurred during process_audio for {os.path.basename(file_path)}.")
+            error_msg = f"Fatal Error: {e}"
+            return error_msg if output_format == "text" else {"error": error_msg}
+
+    # =================================================================================
+    # PRIVATE HELPER METHODS (Ported and adapted from the original AdvTranscriptionClient)
+    # =================================================================================
+
+    def _transcribe_channel(
+        self,
+        channel_segment,
+        channel_name,
+        format_info,
+        temp_dir,
+        model_name,
+        language_code,
+    ):
+        """Helper to export and transcribe a single pydub audio channel."""
+        special_dict_transcription_logger.info(
+            f"  -> Exporting and Preprocessing {channel_name.capitalize()} Channel..."
+        )
+        # Always preprocess channels to the standard format for consistency
+        with tempfile.NamedTemporaryFile(
+            dir=temp_dir, delete=False, suffix=f"_{channel_name}_export.wav"
+        ) as f:
+            temp_channel_file = f.name
+        ok, err = self._export_channel_with_ffmpeg(
+            channel_segment,
+            temp_channel_file,
+            format_info,
+            force_preprocess_format=True,
+        )
+        if not ok:
+            special_dict_transcription_logger.error(f"  ✗ {channel_name.capitalize()} export fail: {err}")
+            return None
+        special_dict_transcription_logger.info(
+            f"  -> Transcribing {channel_name.capitalize()} ({os.path.basename(temp_channel_file)})..."
+        )
+        data = self._transcribe_audio_chunk(
+            temp_channel_file, model_name, language_code
+        )
+        os.remove(temp_channel_file)  # Clean up immediately
+        return data
+
+    def _detect_audio_format(self, file_path):
+        try:
+            command = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                file_path,
+            ]
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=True, timeout=30
+            )
+            data = json.loads(result.stdout)
+            audio_stream = next(
+                (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
+                None,
+            )
+            if not audio_stream:
+                return None
+            duration = float(data.get("format", {}).get("duration", 0.0))
+            return {
+                "channels": audio_stream.get("channels"),
+                "codec_name": audio_stream.get("codec_name"),
+                "sample_rate": int(audio_stream.get("sample_rate", 0)),
+                "duration": duration,
+                "format_name": data.get("format", {}).get("format_name"),
+                "size": data.get("format", {}).get("size", 0)
+            }
+        except Exception as e:
+            special_dict_transcription_logger.error(f"✗ ffprobe error for {os.path.basename(file_path)}: {e}")
+            return None
+
+    def _preprocess_audio_ffmpeg(self, input_path, output_dir):
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=output_dir, suffix="_preprocessed.wav", delete=False
+            ) as temp_f:
+                temp_output_file = temp_f.name
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-ar",
+                str(self.PREPROCESS_SAMPLE_RATE),
+                "-ac",
+                str(self.PREPROCESS_CHANNELS),
+                "-c:a",
+                self.PREPROCESS_CODEC,
+                "-f",
+                "wav",
+                temp_output_file,
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=180)
+            return temp_output_file
+        except Exception as e:
+            special_dict_transcription_logger.error(
+                f"✗ [Preprocess] ffmpeg failed for {os.path.basename(input_path)}: {e}"
+            )
+            return None
+
+    def _export_channel_with_ffmpeg(
+        self,
+        audio_segment,
+        output_path,
+        original_format_info,
+        force_preprocess_format=False,
+    ):
+        temp_input_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix="_pydub_export.wav"
+            ) as temp_f:
+                temp_input_path = temp_f.name
+            audio_segment.export(temp_input_path, format="wav")
+            cmd = ["ffmpeg", "-y", "-i", temp_input_path]
+            if force_preprocess_format:
+                cmd.extend(
+                    [
+                        "-ar",
+                        str(self.PREPROCESS_SAMPLE_RATE),
+                        "-ac",
+                        str(self.PREPROCESS_CHANNELS),
+                        "-c:a",
+                        self.PREPROCESS_CODEC,
+                        "-f",
+                        "wav",
+                    ]
+                )
+            else:
+                cmd.extend(
+                    [
+                        "-c:a",
+                        "pcm_s16le",
+                        "-ar",
+                        str(original_format_info.get("sample_rate", 16000)),
+                        "-ac",
+                        "1",
+                    ]
+                )
+            cmd.append(output_path)
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+            return True, None
+        except Exception as e:
+            special_dict_transcription_logger.error(f"✗ [Export Channel] ffmpeg failed: {e}")
+            return False, str(e)
+        finally:
+            if temp_input_path and os.path.exists(temp_input_path):
+                os.remove(temp_input_path)
+
+    def _transcribe_audio_chunk(
+        self, file_path, model_name, language_code, max_retries=2, retry_delay=2.0
+    ):
+        filename = os.path.basename(file_path)
+        if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
+            special_dict_transcription_logger.warning(f"✗ Skipping transcription for invalid/empty file: {filename}")
+            return None
+        for attempt in range(max_retries):
+            try:
+                with open(file_path, "rb") as f:
+                    files = {"file": f}
+                    data = {
+                        "model": model_name,
+                        "language": language_code,
+                        "response_format": "verbose_json",
+                        "temperature": "0",
+                        "stream": "false",
+                        "vad_filter": "true",
+                        "timestamp_granularities[]": [
+                            "segment",
+                            "word",
+                        ],
+                    }
+                    special_dict_transcription_logger.info(
+                        f"  [Attempt {attempt + 1}] Calling transcription API for {filename}..."
+                    )
+                    response = requests.post(
+                        self.api_url, files=files, data=data, timeout=1800
+                    )
+                    response.raise_for_status()
+                    special_dict_transcription_logger.info(f"  ✓ Success for {filename}.")
+                    json_response = response.json()
+                    if "segments" in json_response and isinstance(
+                        json_response["segments"], list
+                    ):
+                        for segment in json_response["segments"]:
+                            if "words" in segment and segment["words"] is None:
+                                segment["words"] = []
+                    return json_response
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as net_err:
+                special_dict_transcription_logger.warning(f"  ⚠ Network Error for {filename}: {net_err}. Retrying...")
+                time.sleep(retry_delay)
+            except requests.exceptions.RequestException as req_err:
+                err_msg = f"✗ Request Exception (transcription) {filename}: {req_err}"
+                if req_err.response is not None:
+                    err_msg += f" - Status: {req_err.response.status_code} - Resp: {req_err.response.text[:200]}"
+                special_dict_transcription_logger.error(err_msg)
+                break
+            except Exception as e:
+                special_dict_transcription_logger.opt(exception=True).error(f"✗ General Exception during transcription of {filename}: {e}")
+                break
+        special_dict_transcription_logger.error(f"✗ Transcription failed for {filename} after {max_retries} attempts.")
+        return None
+
+    def _save_debug_json(self, data, file_path):
+        """Helper function to save JSON for debugging."""
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            special_dict_transcription_logger.debug(f"  [DEBUG] Saved JSON to: {file_path}")
+        except Exception as e:
+            special_dict_transcription_logger.error(f"  [DEBUG] Failed to save JSON to {file_path}: {e}")
+
+    def _process_file_logic(self, model_name, audio_path, language_code, temp_dir, processing_stats):
+        """The core internal workflow for processing one file."""
+        filename = os.path.basename(audio_path)
+        try:
+            # 1. Detect Audio Format
+            format_info = self._detect_audio_format(audio_path)
+            if not format_info or not format_info.get("channels"):
+                return {
+                    "error": f"Failed to detect audio format or channels for {filename}"
+                }
+            channels = format_info["channels"]
+            total_duration = format_info.get("duration", 0.0)
+            is_stereo = channels == 2
+            initial_data = None
+            path_to_transcribe = audio_path
+            
+            # 2. Initial Transcription
+            if is_stereo:
+                special_dict_transcription_logger.info(f"-> Processing STEREO file: {filename}")
+                try:
+                    audio = AudioSegment.from_file(audio_path)
+                    if audio.channels != 2:
+                        return {"error": "Load error: expected 2 channels"}
+                    left_channel, right_channel = audio.split_to_mono()
+                except (CouldntDecodeError, Exception) as e:
+                    return {"error": f"Audio load/split error: {e}"}
+                
+                future_left = self.executor.submit(
+                    self._transcribe_channel,
+                    left_channel,
+                    "left",
+                    format_info,
+                    temp_dir,
+                    model_name,
+                    language_code,
+                )
+                future_right = self.executor.submit(
+                    self._transcribe_channel,
+                    right_channel,
+                    "right",
+                    format_info,
+                    temp_dir,
+                    model_name,
+                    language_code,
+                )
+                left_data = future_left.result()
+                right_data = future_right.result()
+                
+                if left_data:
+                    self._save_debug_json(
+                        left_data, os.path.join(temp_dir, "1_raw_left_channel.json")
+                    )
+                if right_data:
+                    self._save_debug_json(
+                        right_data, os.path.join(temp_dir, "2_raw_right_channel.json")
+                    )
+                
+                if not left_data or not right_data:
+                    return {"error": "Failed to transcribe one or both channels."}
+                
+                initial_data = self._merge_stereo_results_v3(left_data, right_data)
+                if initial_data:
+                    self._save_debug_json(
+                        initial_data,
+                        os.path.join(temp_dir, "3_initial_merged_stereo.json"),
+                    )
+                if not initial_data:
+                    return {"error": "Initial stereo merge failed."}
+            elif channels == 1:
+                special_dict_transcription_logger.info(f"-> Processing MONO file: {filename}")
+                special_dict_transcription_logger.info(f"  -> Preprocessing MONO {filename}...")
+                temp_preprocessed_mono_file = self._preprocess_audio_ffmpeg(
+                    audio_path, temp_dir
+                )
+                if temp_preprocessed_mono_file:
+                    path_to_transcribe = temp_preprocessed_mono_file
+                    special_dict_transcription_logger.info(
+                        f"  ✓ Preprocessing successful: {os.path.basename(path_to_transcribe)}"
+                    )
+                else:
+                    return {"error": f"Preprocessing failed for {filename}"}
+                
+                special_dict_transcription_logger.info(
+                    f"  -> Transcribing MONO {os.path.basename(path_to_transcribe)}..."
+                )
+                raw_mono_data = self._transcribe_audio_chunk(
+                    path_to_transcribe, model_name, language_code
+                )
+                if not raw_mono_data:
+                    return {"error": "Mono transcription failed"}
+                
+                self._save_debug_json(
+                    raw_mono_data, os.path.join(temp_dir, "1_raw_mono.json")
+                )
+                
+                initial_data = self._parse_transcription(raw_mono_data)
+                if not initial_data:
+                    return {"error": "Mono parsing failed"}
+                
+                self._save_debug_json(
+                    initial_data, os.path.join(temp_dir, "2_initial_parsed_mono.json")
+                )
+            else:
+                return {"error": f"Unsupported channel count: {channels}"}
+            
+            # 3. Re-run & Correction Logic
+            working_data = copy.deepcopy(initial_data)
+            max_correction_passes = 30
+            passes = 0
+            rerun_performed_successfully = False
+            
+            # Initialize the list to track fixed zones
+            fixed_zones = []
+
+            special_dict_transcription_logger.info(
+                f"Correction loop will run for a maximum of {max_correction_passes} fixes."
+            )
+            while passes < max_correction_passes:
+                passes += 1
+                processing_stats["correction_passes"] = passes
+                
+                working_data["segments"].sort(
+                    key=lambda s: s.get("start", float("inf"))
+                )
+                special_dict_transcription_logger.info(f"\n--- Correction Pass {passes} ---")
+                special_dict_transcription_logger.info(
+                    f"  -> Checking for issues (Word > {self.DEFAULT_LONG_WORD_THRESHOLD}s, Gap > {self.DEFAULT_LONG_GAP_THRESHOLD}s)"
+                )
+                detected_issues = self._detect_issues(
+                    working_data["segments"],
+                    self.DEFAULT_LONG_WORD_THRESHOLD,
+                    self.DEFAULT_LONG_GAP_THRESHOLD,
+                    total_duration,
+                    fixed_zones
+                )
+                
+                processing_stats["issues_detected"] = len(detected_issues)
+                
+                # Skip correction phase if too many issues detected initially (indicates problematic audio)
+                if passes == 1 and len(detected_issues) > 40:
+                    special_dict_transcription_logger.info(
+                        f"  ! {len(detected_issues)} issues detected in initial pass. Too many issues - likely problematic audio file. Skipping correction phase."
+                    )
+                    break
+                
+                if not detected_issues:
+                    special_dict_transcription_logger.info("  ✓ No more issues found. Correction phase complete.")
+                    break
+                
+                detected_issues.sort(
+                    key=lambda x: (
+                        0 if x["type"] == "gap" else 1,
+                        -(x["end"] - x["start"]),
+                    )
+                )
+                special_dict_transcription_logger.info(
+                    f"  ! {len(detected_issues)} issue(s) detected in this pass. Attempting to fix the most critical one."
+                )
+                
+                issue = detected_issues[0]
+                special_dict_transcription_logger.info(
+                    f"  -> Processing issue: {issue['type']} @ {issue['start']:.2f}s (duration: {issue['end'] - issue['start']:.2f}s)"
+                )
+                
+                rerun_json, dominant_channel, clip_start_time = (
+                    self._clip_analyze_rerun_single_issue(
+                        audio_path,
+                        format_info,
+                        issue["start"],
+                        issue["end"],
+                        self.DEFAULT_RERUN_PADDING,
+                        total_duration,
+                        model_name,
+                        language_code,
+                        is_stereo,
+                        self.DEFAULT_DBFS_THRESHOLD,
+                    )
+                )
+                
+                if rerun_json and clip_start_time is not None:
+                    merge_success = False
+                    if issue["type"] == "word":
+                        merge_success = self._merge_long_word_result_refined(
+                            working_data, issue, rerun_json, clip_start_time
+                        )
+                    elif issue["type"] == "gap":
+                        merge_success = self._merge_long_gap_result(
+                            working_data,
+                            issue,
+                            rerun_json,
+                            dominant_channel,
+                            clip_start_time,
+                        )
+                    
+                    if merge_success:
+                        # Record the fixed zone
+                        # Add the original issue's time range to our tracking list.
+                        # We use a small buffer to prevent floating point precision issues.
+                        fixed_zones.append({"start": issue['start'] - 0.1, "end": issue['end'] + 0.1})
+                        special_dict_transcription_logger.info(
+                            f"    -> Registered fixed zone: {issue['start']:.2f}s - {issue['end']:.2f}s"
+                        )
+                        
+                        rerun_performed_successfully = True
+                        processing_stats["issues_fixed"] += 1
+                        processing_stats["rerun_performed"] = True
+                        special_dict_transcription_logger.info(
+                            f"    ✓ Merge successful for this issue. Restarting pass."
+                        )
+                        continue
+                    else:
+                        special_dict_transcription_logger.info(f"    ✗ Merge failed. Data not integrated.")
+                elif rerun_json is None and clip_start_time is None:
+                    # Silence detected - mark this zone as processed to avoid re-running
+                    fixed_zones.append({"start": issue['start'] - 0.1, "end": issue['end'] + 0.1})
+                    special_dict_transcription_logger.info(
+                        f"    -> Skipping silence region: {issue['start']:.2f}s - {issue['end']:.2f}s (marked as processed)"
+                    )
+                    continue
+                else:
+                    special_dict_transcription_logger.info(f"    ✗ Clip/Analyze/Transcribe failed for this issue.")
+                
+                special_dict_transcription_logger.info(
+                    "  -> Could not fix the most critical issue, ending correction phase."
+                )
+                break
+            
+            if passes >= max_correction_passes:
+                special_dict_transcription_logger.info(
+                    "  ! Reached maximum correction passes. Finalizing results as is."
+                )
+
+            # 4. Finalization
+            final_data_to_use = None
+            if rerun_performed_successfully:
+                special_dict_transcription_logger.info("\n  -> Finalizing results after successful re-runs...")
+                self._save_debug_json(
+                    working_data, os.path.join(temp_dir, "4_final_corrected.json")
+                )
+                final_data_to_use = working_data
+            else:
+                special_dict_transcription_logger.info(
+                    "\n  -> No successful re-runs were performed. Finalizing initial data."
+                )
+                final_data_to_use = initial_data
+
+            # --- Unified Finalization & Text Formatting ---
+            special_dict_transcription_logger.info("  -> Cleaning and merging segments...")
+            
+            # Apply post-processing: merge segments and clean text
+            clean_segments = self.cleaner.process(final_data_to_use["segments"])
+            final_data_to_use["segments"] = clean_segments
+            
+            special_dict_transcription_logger.info("  -> Generating final transcript text...")
+            final_diarized_parts = []
+            # Ensure segments are sorted by start time before generating text
+            final_data_to_use["segments"].sort(
+                key=lambda s: s.get("start", float("inf"))
+            )
+
+            for i, segment in enumerate(final_data_to_use["segments"]):
+                segment["id"] = i
+                # Re-generate segment text from its words, as it is the source of truth
+                if "words" in segment and isinstance(segment["words"], list):
+                    segment["text"] = "".join(
+                        w.get("word", "") for w in segment["words"]
+                    ).strip()
+
+                text = segment.get("text", "").strip()
+                if text:
+                    channel = segment.get(
+                        "channel", self.AMBIGUOUS_CHANNEL_LABEL if is_stereo else ""
+                    )
+                    speaker_str = f"[{channel}]: " if is_stereo and channel else ""
+                    final_diarized_parts.append(f"{speaker_str}{text}")
+
+            final_data_to_use["text"] = "\n".join(final_diarized_parts)
+            special_dict_transcription_logger.info("  ✓ Finalization complete.")
+            return final_data_to_use
+
+        except Exception as e:
+            special_dict_transcription_logger.opt(exception=True).error(f"✗ UNEXPECTED ERROR in _process_file_logic for {filename}: {e}")
+            return {"error": f"Unexpected task error: {e}"}
+
+    def _parse_transcription(self, data):
+        if not isinstance(data, dict) or "segments" not in data:
+            return None
+        # Basic validation and structuring
+        for segment in data.get("segments", []):
+            if "words" not in segment:
+                segment["words"] = []
+        return {
+            "is_stereo_merged": False,
+            "language": data.get("language", "th"),
+            "duration": data.get("duration", 0.0),
+            "text": data.get("text", ""),
+            "segments": data.get("segments", []),
+        }
+
+    def _rebuild_words(self, words, max_gap):
+        """Collapse consecutive tokens spoken by one speaker when the silence
+        between them is < *max_gap* seconds.
+        """
+        if not words:
+            return []
+        rebuilt = []
+        # Ensure tokens are time-ordered (though they should be per-channel)
+        sorted_words = sorted(words, key=lambda w: w.get("start", float("inf")))
+        current = sorted_words[0].copy()
+        for i in range(1, len(sorted_words)):
+            token = sorted_words[i]
+            # The 'channel' key is guaranteed to be the same within this list
+            is_close = (token.get("start", 0) - current.get("end", 0)) <= max_gap
+            if is_close:
+                # Extend the current word
+                current["word"] += token.get("word", "")
+                current["end"] = token.get("end")
+            else:
+                rebuilt.append(current)
+                current = token.copy()
+        if current:
+            rebuilt.append(current)
+        return rebuilt
+
+    def _merge_stereo_results_v2(self, left_data, right_data):
+        """
+        Performs a robust, word-level merge of two stereo transcription results.
+        This method correctly interleaves conversational turns, handles overlaps,
+        and reconstructs the dialogue chronologically.
+        """
+        if not left_data or not right_data:
+            return None
+        
+        all_words = []
+        for word in left_data.get("words", []):
+            word["channel"] = self.LEFT_CHANNEL_LABEL
+            all_words.append(word)
+        for word in right_data.get("words", []):
+            word["channel"] = self.RIGHT_CHANNEL_LABEL
+            all_words.append(word)
+        
+        all_words.sort(key=lambda w: w.get("start", float("inf")))
+        
+        if not all_words:
+            return {
+                "is_stereo_merged": True,
+                "language": left_data.get("language", "th"),
+                "duration": max(
+                    left_data.get("duration", 0), right_data.get("duration", 0)
+                ),
+                "text": "",
+                "segments": [],
+                "words": [],
+            }
+        
+        new_segments = []
+        current_segment = None
+        
+        for i, word in enumerate(all_words):
+            is_new_speaker = (
+                current_segment is not None
+                and word["channel"] != current_segment["channel"]
+            )
+            last_word_end = all_words[i - 1]["end"] if i > 0 else 0
+            is_long_pause = (
+                word["start"] - last_word_end
+            ) > self.DEFAULT_NEW_TURN_THRESHOLD
+            
+            if current_segment is None or is_new_speaker or is_long_pause:
+                if current_segment:
+                    current_segment["text"] = "".join(
+                        w.get("word", "") for w in current_segment["words"]
+                    ).strip()
+                    new_segments.append(current_segment)
+                
+                current_segment = {
+                    "id": len(new_segments),
+                    "seek": 0,
+                    "start": word["start"],
+                    "end": word["end"],
+                    "text": "",
+                    "channel": word["channel"],
+                    "words": [word],
+                }
+            else:
+                current_segment["words"].append(word)
+                current_segment["end"] = word["end"]
+        
+        if current_segment:
+            current_segment["text"] = "".join(
+                w.get("word", "") for w in current_segment["words"]
+            ).strip()
+            new_segments.append(current_segment)
+        
+        diarized_text_parts = []
+        for segment in new_segments:
+            text = segment.get("text", "").strip()
+            if text:
+                diarized_text_parts.append(f"[{segment.get('channel')}]: {text}")
+        
+        return {
+            "is_stereo_merged": True,
+            "language": left_data.get("language", "th"),
+            "duration": max(
+                left_data.get("duration", 0), right_data.get("duration", 0)
+            ),
+            "text": "\n".join(diarized_text_parts),
+            "segments": new_segments,
+            "words": all_words,
+        }
+
+    def _merge_stereo_results_v3(self, left_data, right_data):
+        """
+        Performs a robust, word-level merge of two stereo transcription results with advanced logic.
+        This method incorporates word rebuilding, refined segmentation, and segment fusing.
+        """
+        # --- START: Add these constants ---
+        REBUILD_GAP = 0.20
+        NEW_TURN_THRESHOLD = 1.0
+        FUSE_GAP = 0.25
+        # --- END: Add these constants ---
+
+        if not left_data or not right_data:
+            return None
+        
+        # --- REPLACE with this new block ---
+        # 1. Stamp channel on each word
+        left_words_raw = left_data.get("words", [])
+        for w in left_words_raw:
+            w["channel"] = self.LEFT_CHANNEL_LABEL
+
+        right_words_raw = right_data.get("words", [])
+        for w in right_words_raw:
+            w["channel"] = self.RIGHT_CHANNEL_LABEL
+
+        # 2. Collapse micro-tokens within each channel
+        left_words_rebuilt = self._rebuild_words(left_words_raw, REBUILD_GAP)
+        right_words_rebuilt = self._rebuild_words(right_words_raw, REBUILD_GAP)
+
+        # 3. Collect & sort all rebuilt words
+        all_words = sorted(
+            left_words_rebuilt + right_words_rebuilt,
+            key=lambda w: w.get("start", float("inf"))
+        )
+        
+        if not all_words:
+            return {
+                "is_stereo_merged": True,
+                "language": left_data.get("language", "th"),
+                "duration": max(
+                    left_data.get("duration", 0), right_data.get("duration", 0)
+                ),
+                "text": "",
+                "segments": [],
+                "words": [],
+            }
+        
+        new_segments = []
+        current_segment = None
+        
+        for i, word in enumerate(all_words):
+            last_word_end = all_words[i - 1].get("end", 0.0) if i > 0 else 0.0
+            gap_since_last_word = word.get("start", 0.0) - last_word_end
+
+            is_new_speaker = (
+                current_segment is not None
+                and word.get("channel") != current_segment.get("channel")
+            )
+            is_same_speaker_with_long_pause = (
+                not is_new_speaker and gap_since_last_word > NEW_TURN_THRESHOLD
+            )
+
+            should_start_new_segment = (
+                current_segment is None or is_new_speaker or is_same_speaker_with_long_pause
+            )
+            
+            if should_start_new_segment:
+                if current_segment:
+                    current_segment["text"] = "".join(
+                        w.get("word", "") for w in current_segment["words"]
+                    ).strip()
+                    new_segments.append(current_segment)
+                
+                current_segment = {
+                    "id": len(new_segments),
+                    "seek": 0,
+                    "start": word["start"],
+                    "end": word["end"],
+                    "text": "",
+                    "channel": word["channel"],
+                    "words": [word],
+                }
+            else:
+                current_segment["words"].append(word)
+                current_segment["end"] = word["end"]
+        
+        if current_segment:
+            current_segment["text"] = "".join(
+                w.get("word", "") for w in current_segment["words"]
+            ).strip()
+            new_segments.append(current_segment)
+
+        # --- START: Add this new fusing logic ---
+        if not new_segments:
+            fused_segments = []
+        else:
+            fused_segments = [new_segments[0]]
+            for i in range(1, len(new_segments)):
+                prev_seg = fused_segments[-1]
+                curr_seg = new_segments[i]
+                
+                is_same_channel = prev_seg.get("channel") == curr_seg.get("channel")
+                is_close_gap = (curr_seg.get("start", 0) - prev_seg.get("end", 0)) < FUSE_GAP
+
+                if is_same_channel and is_close_gap:
+                    # Stitch the current segment to the previous one
+                    prev_seg["words"].extend(curr_seg.get("words", []))
+                    prev_seg["end"] = curr_seg.get("end")
+                    # Rebuild the text for the fused segment
+                    prev_seg["text"] = "".join(
+                        w.get("word", "") for w in prev_seg["words"]
+                    ).strip()
+                else:
+                    # Append as a new segment
+                    fused_segments.append(curr_seg)
+        # --- END: Add this new fusing logic ---
+
+        # --- UPDATE the rest of the function to use the fused result ---
+        diarized_text_parts = []
+        for segment in fused_segments: # <-- Use fused_segments here
+            text = segment.get("text", "").strip()
+            if text:
+                diarized_text_parts.append(f"[{segment.get('channel')}]: {text}")
+
+        return {
+            "is_stereo_merged": True,
+            "language": left_data.get("language", "th"),
+            "duration": max(
+                left_data.get("duration", 0), right_data.get("duration", 0)
+            ),
+            "text": "\n".join(diarized_text_parts),
+            "segments": fused_segments, # <-- Use fused_segments here
+            "words": all_words,
+        }
+
+    def _detect_issues(self, segments, word_thresh, gap_thresh, audio_duration=None, fixed_zones=None):
+        """
+        Detects issues, ignoring gaps that fall within already re-processed zones.
+        """
+        if fixed_zones is None:
+            fixed_zones = []
+            
+        issues = []
+
+        # Helper function to check if a time range is inside a fixed zone
+        def is_in_fixed_zone(start_time, end_time):
+            for zone in fixed_zones:
+                # Check if the potential issue is fully contained within a fixed zone
+                if start_time >= zone['start'] and end_time <= zone['end']:
+                    return True
+            return False
+        # --- Issue Type 1: Long Words (No changes needed here) ---
+        for i, seg in enumerate(segments):
+            for j, word in enumerate(seg.get("words", [])):
+                duration = word.get("end", 0) - word.get("start", 0)
+                if duration > word_thresh:
+                    # Long words are always a high-priority issue, regardless of zone.
+                    issues.append(
+                        {
+                            "type": "word",
+                            "segment_index": i,
+                            "word_index": j,
+                            "start": word["start"],
+                            "end": word["end"],
+                            "original_word": word.get("word"),
+                        }
+                    )
+
+        # --- Issue Type 2: Long Gaps (MODIFIED LOGIC) ---
+        sorted_segments = sorted(segments, key=lambda s: s.get("start", float('inf')))
+        
+        # Check for gap at the beginning
+        if sorted_segments and audio_duration is not None:
+            first_seg_start = sorted_segments[0].get("start", 0)
+            if first_seg_start > gap_thresh:
+                if not is_in_fixed_zone(0.0, first_seg_start):
+                    issues.append({"type": "gap", "start": 0.0, "end": first_seg_start})
+
+        # Check for gaps between segments
+        for i in range(len(sorted_segments) - 1):
+            prev_segment = sorted_segments[i]
+            next_segment = sorted_segments[i+1]
+            prev_end = prev_segment.get("end", 0)
+            next_start = next_segment.get("start", 0)
+            
+            if prev_end > 0 and next_start > prev_end:
+                gap_duration = next_start - prev_end
+                if gap_duration > gap_thresh:
+                    if not is_in_fixed_zone(prev_end, next_start):
+                        issues.append({"type": "gap", "start": prev_end, "end": next_start})
+        
+        # Check for gap at the end
+        if sorted_segments and audio_duration is not None and audio_duration > 0:
+            last_seg_end = sorted_segments[-1].get("end", 0)
+            if (audio_duration - last_seg_end) > gap_thresh:
+                if not is_in_fixed_zone(last_seg_end, audio_duration):
+                    issues.append({"type": "gap", "start": last_seg_end, "end": audio_duration})
+
+        return issues
+
+    def _clip_analyze_rerun_single_issue(
+        self,
+        audio_path,
+        format_info,
+        start,
+        end,
+        padding,
+        duration,
+        model,
+        lang,
+        is_stereo,
+        dbfs_thresh,
+    ):
+        clip_start = max(0.0, start - padding)
+        clip_end = min(duration, end + padding) if duration > 0 else end + padding
+        if clip_start >= clip_end:
+            return None, None, None
+        
+        with tempfile.TemporaryDirectory() as temp_clip_dir:
+            temp_clip_path = os.path.join(temp_clip_dir, "clip.wav")
+            try:
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-ss",
+                    str(clip_start),
+                    "-to",
+                    str(clip_end),
+                    "-c:a",
+                    "pcm_s16le",
+                    temp_clip_path,
+                ]
+                subprocess.run(
+                    cmd, capture_output=True, text=True, check=True, timeout=120
+                )
+            except subprocess.CalledProcessError as e:
+                special_dict_transcription_logger.error(f"    ✗ ffmpeg clip failed: {e.stderr}")
+                return None, None, None
+            
+            dominant_channel = None
+            if is_stereo:
+                try:
+                    clip_audio = AudioSegment.from_file(temp_clip_path)
+                    if clip_audio.channels == 2:
+                        left, right = clip_audio.split_to_mono()
+                        db_diff = left.dBFS - right.dBFS
+                        if math.isfinite(db_diff):
+                            if db_diff > dbfs_thresh:
+                                dominant_channel = self.LEFT_CHANNEL_LABEL
+                            elif db_diff < -dbfs_thresh:
+                                dominant_channel = self.RIGHT_CHANNEL_LABEL
+                except Exception as e:
+                    special_dict_transcription_logger.error(f"  [Re-run Chan] Error analyzing dominance: {e}")
+            
+            preprocessed_clip_path = self._preprocess_audio_ffmpeg(
+                temp_clip_path, temp_clip_dir
+            )
+            if not preprocessed_clip_path:
+                special_dict_transcription_logger.info(
+                    "    [Re-run Transcribe] Preprocessing clip failed. Aborting re-run for this issue."
+                )
+                return None, None, None
+            
+            rerun_json = self._transcribe_audio_chunk(
+                preprocessed_clip_path, model, lang
+            )
+            if rerun_json and rerun_json.get("text", "").strip():
+                rerun_text = rerun_json.get("text").strip()
+                special_dict_transcription_logger.info(f'    [Re-run Result] 🗣️  "{rerun_text}"')
+                return rerun_json, dominant_channel, clip_start
+            else:
+                special_dict_transcription_logger.info("    [Re-run Result] 묵 (Silence or no text detected)")
+                return None, None, None
+
+    def _merge_long_word_result_refined(
+        self, working_data, issue_info, rerun_json, clip_start_time
+    ):
+        try:
+            rerun_words_raw = [
+                word
+                for seg in rerun_json.get("segments", [])
+                for word in seg.get("words", [])
+            ]
+            if not rerun_words_raw:
+                return False
+            
+            adjusted_words = []
+            for word in rerun_words_raw:
+                adjusted_words.append(
+                    {
+                        "start": clip_start_time + float(word["start"]),
+                        "end": clip_start_time + float(word["end"]),
+                        "word": word.get("word", ""),
+                    }
+                )
+            
+            seg_idx, word_idx = issue_info["segment_index"], issue_info["word_index"]
+            target_words_list = working_data["segments"][seg_idx]["words"]
+            
+            if word_idx >= len(target_words_list):
+                return False
+            
+            target_words_list[word_idx : word_idx + 1] = adjusted_words
+            working_data["segments"][seg_idx]["text"] = "".join(
+                w.get("word", "") for w in target_words_list
+            ).strip()
+            
+            return True
+        except Exception as e:
+            special_dict_transcription_logger.error(f"  ✗ [Merge Word Refined] Error: {e}")
+            return False
+
+    def _merge_long_gap_result(
+        self, working_data, issue_info, rerun_json, dominant_channel, clip_start_time
+    ):
+        try:
+            new_segments = rerun_json.get("segments", [])
+            if not new_segments:
+                return False
+            
+            for new_seg in new_segments:
+                adjusted_seg = copy.deepcopy(new_seg)
+                adjusted_seg["start"] = clip_start_time + float(adjusted_seg["start"])
+                adjusted_seg["end"] = clip_start_time + float(adjusted_seg["end"])
+                
+                if "words" in adjusted_seg:
+                    for word in adjusted_seg["words"]:
+                        word["start"] = clip_start_time + float(word["start"])
+                        word["end"] = clip_start_time + float(word["end"])
+                
+                if working_data.get("is_stereo_merged"):
+                    adjusted_seg["channel"] = (
+                        dominant_channel
+                        if dominant_channel
+                        else self.AMBIGUOUS_CHANNEL_LABEL
+                    )
+                
+                working_data["segments"].append(adjusted_seg)
+            
+            return True
+        except Exception as e:
+            special_dict_transcription_logger.error(f"  ✗ [Merge Gap] Error: {e}")
+            return False
+
+
+if __name__ == "__main__":
+    # --- Example Usage ---
+    API_ENDPOINT_URL = "http://localhost:8000/v1/audio/transcriptions"
+    MODEL_PATH = "/path/to/your/model"  # <<< IMPORTANT: Update this path
+    LANGUAGE = "th"
+    STEREO_FILE_PATH = "test_stereo.wav"
+    MONO_FILE_PATH = "test_mono.wav"
+    
+    if not os.path.exists(STEREO_FILE_PATH) or not os.path.exists(MONO_FILE_PATH):
+        special_dict_transcription_logger.info("\nCreating dummy audio files for demonstration...")
+        try:
+            silence_1s = AudioSegment.silent(duration=1000)
+            left_channel = silence_1s - 6
+            right_channel = silence_1s
+            stereo_sound = AudioSegment.from_mono_audiosegments(
+                left_channel, right_channel
+            )
+            stereo_sound.export(STEREO_FILE_PATH, format="wav")
+            special_dict_transcription_logger.info(f"✓ Created dummy stereo file: {STEREO_FILE_PATH}")
+            
+            mono_sound = AudioSegment.silent(duration=2000)
+            mono_sound.export(MONO_FILE_PATH, format="wav")
+            special_dict_transcription_logger.info(f"✓ Created dummy mono file: {MONO_FILE_PATH}")
+        except Exception as e:
+            special_dict_transcription_logger.error(
+                f"✗ Could not create dummy audio files. Please provide your own. Error: {e}"
+            )
+            sys.exit(1)
+    
+    try:
+        enhanced_client = AdvDictTranscriptionClient(
+            api_url=API_ENDPOINT_URL, max_workers=2
+        )
+        enhanced_client.DEFAULT_LONG_WORD_THRESHOLD = 4.5
+        special_dict_transcription_logger.info(
+            f"\nEnhanced client initialized. Long word threshold set to: {enhanced_client.DEFAULT_LONG_WORD_THRESHOLD}s"
+        )
+
+        # --- Processing with different output formats ---
+        special_dict_transcription_logger.info("\n" + "=" * 60)
+        special_dict_transcription_logger.info(f"--- Processing Stereo File: {STEREO_FILE_PATH} ---")
+        special_dict_transcription_logger.info("=" * 60)
+        
+        # Example 1: Get both text and JSON
+        special_dict_transcription_logger.info("\n1. Getting both text and JSON output:")
+        result_both = enhanced_client.process_audio(
+            model_name=MODEL_PATH,
+            file_path=STEREO_FILE_PATH,
+            language_code=LANGUAGE,
+            output_format="both",
+            text_format="timestamped"
+        )
+        special_dict_transcription_logger.info("--- TEXT OUTPUT ---")
+        special_dict_transcription_logger.info(result_both["text"])
+        special_dict_transcription_logger.info("\n--- JSON METADATA ---")
+        special_dict_transcription_logger.info(f"Duration: {result_both['json']['metadata']['duration']:.2f}s")
+        special_dict_transcription_logger.info(f"Language: {result_both['json']['metadata']['language']}")
+        special_dict_transcription_logger.info(f"Segments: {len(result_both['json']['segments'])}")
+        special_dict_transcription_logger.info(f"Words: {len(result_both['json']['words'])}")
+        special_dict_transcription_logger.info(f"Processing Time: {result_both['json']['metadata']['processing_info'].get('total_duration', 0):.2f}s")
+        
+        # Example 2: Get only text with different formatting
+        special_dict_transcription_logger.info("\n2. Getting text-only output with SRT formatting:")
+        result_srt = enhanced_client.process_audio(
+            model_name=MODEL_PATH,
+            file_path=STEREO_FILE_PATH,
+            language_code=LANGUAGE,
+            output_format="text",
+            text_format="srt"
+        )
+        special_dict_transcription_logger.info("--- SRT FORMAT ---")
+        special_dict_transcription_logger.info(result_srt)
+        
+        # Example 3: Get only JSON for programmatic access
+        special_dict_transcription_logger.info("\n3. Getting JSON-only output:")
+        result_json = enhanced_client.process_audio(
+            model_name=MODEL_PATH,
+            file_path=STEREO_FILE_PATH,
+            language_code=LANGUAGE,
+            output_format="json"
+        )
+        special_dict_transcription_logger.info("--- JSON STRUCTURE KEYS ---")
+        special_dict_transcription_logger.info(f"Top-level keys: {list(result_json.keys())}")
+        special_dict_transcription_logger.info(f"Metadata keys: {list(result_json['metadata'].keys())}")
+        
+        # Example 4: Process mono file
+        special_dict_transcription_logger.info("\n" + "=" * 60)
+        special_dict_transcription_logger.info(f"--- Processing Mono File: {MONO_FILE_PATH} ---")
+        special_dict_transcription_logger.info("=" * 60)
+        
+        result_mono = enhanced_client.process_audio(
+            model_name=MODEL_PATH,
+            file_path=MONO_FILE_PATH,
+            language_code=LANGUAGE,
+            output_format="both",
+            text_format="simple"
+        )
+        special_dict_transcription_logger.info("--- MONO TEXT OUTPUT ---")
+        special_dict_transcription_logger.info(result_mono["text"])
+        special_dict_transcription_logger.info(f"\n--- MONO METADATA ---")
+        special_dict_transcription_logger.info(f"Is Stereo: {result_mono['json']['metadata']['is_stereo_merged']}")
+        special_dict_transcription_logger.info(f"Segments: {len(result_mono['json']['segments'])}")
+        
+    except (ValueError, RuntimeError) as e:
+        special_dict_transcription_logger.error(f"\nInitialization failed: {e}")
+    except Exception as e:
+        special_dict_transcription_logger.opt(exception=True).error(f"\nAn error occurred during the example run: {e}")

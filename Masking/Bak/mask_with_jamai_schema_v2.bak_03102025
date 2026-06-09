@@ -1,0 +1,789 @@
+"""Step 4 of masking pipeline: Apply audio masking (beeps) to sensitive timestamps."""
+
+import os
+import re
+import json
+import math
+import numpy as np
+import sys
+import argparse
+import traceback
+import shutil
+from collections import defaultdict
+import subprocess
+from datetime import datetime
+from typing import Optional, Dict, List, Any
+from dotenv import load_dotenv
+from pydub import AudioSegment
+from jamaibase import JamAI, protocol as p
+from jamaibase.exceptions import ResourceNotFoundError, JamaiException
+try:
+    from Masking.logging_utils import LOGGER
+except ImportError:
+    from logging_utils import LOGGER
+
+# Initialize pipeline logger
+pipeline_logger = LOGGER.bind(type="pipeline", service_name="mask_with_jamai")
+
+# --- Configuration ---
+load_dotenv()
+
+# Constants
+PROJECT_ID = os.getenv("PROJECT_ID", "proj_d51957697af3bcec339092cb")
+JAMAI_API_BASE = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+TABLE_TYPE = p.TableType.action
+INPUT_TABLE_PREFIX = "step3b_"
+DEFAULT_OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "CSH_SH_mask")
+JAMAI_MAX_ROWS_PER_REQUEST = 100  # JamAI API limit: max 100 rows per request
+
+def run_mask_with_jamai_step(
+    input_table: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    file_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None
+) -> Dict[str, int]:
+    """Process audio masking from input table and save masked files.
+    
+    Args:
+        input_table: Explicit input table ID or None to auto-detect
+        output_dir: Directory to save masked files (None uses default)
+        file_limit: Max files to process (None processes all)
+        jamai_client: Optional pre-configured JamAI client
+        
+    Returns:
+        Dictionary with processing stats: {
+            'total_files': int,
+            'successful': int, 
+            'failed': int
+        }
+        
+    Raises:
+        JamaiException: For JamAI-specific errors
+        ValueError: For invalid inputs
+        OSError: For filesystem errors
+    """
+    jamai = jamai_client or JamAI(project_id=PROJECT_ID, api_base=JAMAI_API_BASE)
+    output_dir = output_dir or DEFAULT_OUTPUT_DIR
+    
+    # Ensure output directory exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        pipeline_logger.info(f"Created output directory: {output_dir}")
+    
+    # Determine input table ID
+    if input_table:
+        try:
+            jamai.table.get_table(table_type=TABLE_TYPE, table_id=input_table)
+            pipeline_logger.info(f"Using specified input table: {input_table}")
+            if not input_table.startswith(INPUT_TABLE_PREFIX):
+                pipeline_logger.warning(f"Table '{input_table}' doesn't match expected prefix")
+        except ResourceNotFoundError:
+            raise ResourceNotFoundError(f"Input table '{input_table}' not found")
+    else:
+        input_table = find_latest_table(INPUT_TABLE_PREFIX, jamai)
+        if not input_table:
+            raise ResourceNotFoundError(f"No tables found matching prefix '{INPUT_TABLE_PREFIX}'")
+    
+    pipeline_logger.info(f"Processing audio masking from table: {input_table}")
+    pipeline_logger.info(f"Saving masked files to: {output_dir}")
+    pipeline_logger.info(f"File processing limit: {file_limit if file_limit is not None else 'All'}")
+
+    # Main processing logic
+    all_rows = fetch_all_rows_from_table(input_table, jamai)
+    if not all_rows:
+        return {'total_files': 0, 'successful': 0, 'failed': 0}
+    
+    grouped_rows = group_rows_by_file(all_rows)
+    if not grouped_rows:
+        return {'total_files': 0, 'successful': 0, 'failed': 0}
+    
+    files_to_process = list(grouped_rows.keys())
+    if file_limit is not None:
+        files_to_process = files_to_process[:file_limit]
+    
+    stats = {'total_files': len(files_to_process), 'successful': 0, 'failed': 0}
+    
+    for i, file_path in enumerate(files_to_process, 1):
+        pipeline_logger.info(f"\n[{i}/{len(files_to_process)}] Processing: {os.path.basename(file_path)}")
+        try:
+            success = process_grouped_audio_file(file_path, grouped_rows[file_path], output_dir)
+            if success:
+                stats['successful'] += 1
+            else:
+                stats['failed'] += 1
+        except Exception as e:
+            pipeline_logger.opt(exception=True).error(f"Error processing {os.path.basename(file_path)}: {e}")
+            stats['failed'] += 1
+    
+    return stats
+
+# --- Default Runtime Values ---
+# These will be overridden when running as main script
+input_table = None
+limit = None
+output_dir = DEFAULT_OUTPUT_DIR
+
+# --- 5. Helper Functions ---
+
+def parse_timestamp_from_id(table_id, prefix):
+    """Extracts YYYYMMDD_HHMMSS from table ID if it matches prefix."""
+    if table_id and table_id.startswith(prefix):
+        timestamp_part = table_id[len(prefix):]
+        try:
+            datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
+            return timestamp_part
+        except ValueError:
+            return None
+    return None
+
+def find_latest_table(prefix: str, jamai: 'JamAI') -> Optional[str]:
+    """Finds the latest table matching the prefix.
+    
+    Args:
+        prefix: Table ID prefix to match
+        jamai: Initialized JamAI client
+        
+    Returns:
+        Latest table ID or None if none found
+        
+    Raises:
+        JamaiException: For JamAI-specific errors
+    """
+    pipeline_logger.info(f"Finding latest table with prefix '{prefix}'...")
+    latest_dt = None
+    latest_table_id = None
+    try:
+        list_response = jamai.table.list_tables(table_type=TABLE_TYPE)
+        found_tables = []
+        for item in list_response.items:
+            timestamp_str = parse_timestamp_from_id(item.id, prefix)
+            if timestamp_str:
+                try:
+                    dt_obj = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                    found_tables.append((dt_obj, item.id))
+                except ValueError:
+                    pipeline_logger.warning(f"Could not parse timestamp from potential table '{item.id}'")
+
+        if not found_tables:
+            pipeline_logger.warning(f"No tables found matching prefix '{prefix}'.")
+            return None # Return None if no table found
+
+        found_tables.sort(key=lambda x: x[0], reverse=True)
+        latest_dt, latest_table_id = found_tables[0]
+        pipeline_logger.info(f"Found latest table: '{latest_table_id}'")
+        return latest_table_id
+
+    except JamaiException as e:
+        pipeline_logger.opt(exception=True).error(f"FATAL ERROR listing tables to find latest for prefix '{prefix}': {e}")
+        sys.exit(1) # Exit on critical error
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"FATAL ERROR finding latest table for prefix '{prefix}': {e}")
+
+def extract_field_value(field):
+    """Extract value from field dictionary if needed"""
+    if isinstance(field, dict) and "value" in field:
+        return field["value"]
+    return field
+
+def fetch_all_rows_from_table(table_id: str, jamai: 'JamAI') -> List[Any]:
+    """Fetch all rows from the table using JamAI pagination.
+    
+    Args:
+        table_id: ID of table to fetch from
+        jamai: Initialized JamAI client
+        
+    Returns:
+        List of table rows
+        
+    Raises:
+        JamaiException: For JamAI-specific errors
+    """
+    all_rows = []
+    offset = 0
+    page_num = 1
+    
+    pipeline_logger.info(f"Reading all rows from table '{table_id}' (JamAI limit: {JAMAI_MAX_ROWS_PER_REQUEST} rows per request)...")
+    
+    while True:
+        try:
+            pipeline_logger.info(f"  Fetching page {page_num} (offset={offset}, limit={JAMAI_MAX_ROWS_PER_REQUEST})...")
+            
+            rows_response = jamai.table.list_table_rows(
+                table_type=TABLE_TYPE,
+                table_id=table_id,
+                columns=["file_path", "Segment_ID", "Combined"],
+                limit=JAMAI_MAX_ROWS_PER_REQUEST,  # JamAI max limit
+                offset=offset
+            )
+            
+            if not rows_response or not rows_response.items:
+                pipeline_logger.info(f"  No more rows found at offset {offset}")
+                break
+                
+            fetched_count = len(rows_response.items)
+            all_rows.extend(rows_response.items)
+            pipeline_logger.info(f"  ✓ Fetched {fetched_count} rows (total so far: {len(all_rows)})")
+            
+            # If we got fewer rows than the limit, we've reached the end
+            if fetched_count < JAMAI_MAX_ROWS_PER_REQUEST:
+                pipeline_logger.info(f"  Reached end of table (got {fetched_count} < {JAMAI_MAX_ROWS_PER_REQUEST})")
+                break
+            
+            # Move to next page
+            offset += JAMAI_MAX_ROWS_PER_REQUEST
+            page_num += 1
+            
+        except JamaiException as e:
+            pipeline_logger.error(f"  ✗ JamAI API error fetching page {page_num}: {e}")
+            if e.status_code == 404:
+                pipeline_logger.info("  Table not found, stopping pagination")
+                break
+            # For other errors, try to continue
+            pipeline_logger.info("  Continuing to next page...")
+            offset += JAMAI_MAX_ROWS_PER_REQUEST
+            page_num += 1
+            continue
+            
+        except Exception as e:
+            pipeline_logger.opt(exception=True).error(f"  ✗ Unexpected error fetching page {page_num}: {e}")
+            break
+    
+    pipeline_logger.info(f"✓ Completed table read: {len(all_rows)} total rows from {page_num-1} pages")
+    return all_rows
+
+def group_rows_by_file(all_rows: List[Any]) -> Dict[str, List[Any]]:
+    """Group rows by their file_path values.
+    
+    Args:
+        all_rows: List of table rows to group
+        
+    Returns:
+        Dictionary mapping file_path to list of rows
+    """
+    grouped = defaultdict(list)
+    skipped_count = 0
+    
+    for row in all_rows:
+        file_path = extract_field_value(row.get("file_path"))
+        if file_path:
+            grouped[file_path].append(row)
+        else:
+            skipped_count += 1
+    
+    grouped_dict = dict(grouped)
+    
+    pipeline_logger.info(f"\n--- Grouping Results ---")
+    pipeline_logger.info(f"Unique audio files: {len(grouped_dict)}")
+    pipeline_logger.info(f"Skipped rows (no file_path): {skipped_count}")
+    
+    for file_path, rows in grouped_dict.items():
+        pipeline_logger.info(f"  {os.path.basename(file_path)}: {len(rows)} phases")
+    
+    return grouped_dict
+
+def generate_beep(frequency=350, duration_ms=1000, sample_rate=44100, fade_ms=30):
+    """Generate a sine wave beep tone with smooth fade in/out."""
+    duration_seconds = duration_ms / 1000.0
+    samples = int(sample_rate * duration_seconds)
+    t = np.linspace(0, duration_seconds, samples, False)
+    sine_wave = np.sin(2 * np.pi * frequency * t)
+    fade_samples = int(fade_ms / 1000.0 * sample_rate)
+    if 2 * fade_samples < samples:
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+        sine_wave[:fade_samples] *= fade_in
+        sine_wave[-fade_samples:] *= fade_out
+    sine_wave = (sine_wave * 32767 * 0.8).astype(np.int16)
+    return AudioSegment(
+        sine_wave.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1
+    )
+
+def extract_timestamps(timestamp_data):
+    """Extract the JSON array of timestamps from the Combined field."""
+    if not timestamp_data:
+        return []
+    pattern = r'<Conclusion>\s*(.*?)\s*</Conclusion>'
+    match = re.search(pattern, timestamp_data, re.DOTALL | re.IGNORECASE) # Case-insensitive tag matching
+    if not match:
+        pipeline_logger.warning("    No Machine_Readable_Output found in timestamp data")
+        return []
+    try:
+        json_str = match.group(1).strip()
+        timestamps = json.loads(json_str)
+        # Validate structure: expect a list of dicts with 'start' and 'end'
+        if not isinstance(timestamps, list):
+             pipeline_logger.error(f"    Parsed timestamp JSON is not a list: {type(timestamps)}")
+             return []
+        valid_timestamps = []
+        for ts in timestamps:
+             if isinstance(ts, dict) and 'start' in ts and 'end' in ts:
+                  try:
+                       # Ensure start/end are numbers
+                       start_s = float(ts['start'])
+                       end_s = float(ts['end'])
+                       if start_s < end_s: # Basic sanity check
+                            valid_timestamps.append({'start': start_s, 'end': end_s})
+                       else:
+                            pipeline_logger.warning(f"    Skipping invalid timestamp range (start >= end): {ts}")
+                  except (ValueError, TypeError):
+                       pipeline_logger.warning(f"    Skipping timestamp with non-numeric start/end: {ts}")
+             else:
+                  pipeline_logger.warning(f"    Skipping invalid timestamp entry format: {ts}")
+        return valid_timestamps
+    except json.JSONDecodeError as e:
+        pipeline_logger.error(f"    Error parsing timestamp JSON: {e}")
+        pipeline_logger.error(f"    Problematic JSON string (first 100 chars): {json_str[:100]}")
+        return []
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"    Unexpected error extracting timestamps: {e}")
+        return []
+
+def detect_audio_format(file_path):
+    """Detect audio format using FFprobe."""
+    try:
+        ffprobe_cmd = [
+            "ffprobe", "-v", "error", "-show_entries",
+            "stream=codec_name,sample_rate,channels,bits_per_sample",
+            "-of", "default=noprint_wrappers=1:nokey=1", # Use nokey=1 for key=value output
+            file_path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+        ffprobe_output = result.stdout.strip()
+        format_info = {}
+        for line in ffprobe_output.split('\n'):
+            if '=' in line:
+                key, value = line.split('=', 1)
+                format_info[key.strip()] = value.strip()
+
+        return {
+            "codec": format_info.get("codec_name"),
+            "sample_rate": int(format_info["sample_rate"]) if "sample_rate" in format_info else None,
+            "channels": int(format_info["channels"]) if "channels" in format_info else None,
+            "bits_per_sample": int(format_info["bits_per_sample"]) if "bits_per_sample" in format_info else None
+        }
+    except FileNotFoundError:
+        pipeline_logger.error("    ffprobe command not found. Please ensure ffmpeg (which includes ffprobe) is installed and in your PATH.")
+        return {"codec": None, "sample_rate": None, "channels": None, "bits_per_sample": None}
+    except subprocess.CalledProcessError as e:
+        pipeline_logger.error(f"    FFprobe execution failed for {os.path.basename(file_path)}: {e}")
+        pipeline_logger.error(f"    FFprobe stderr: {e.stderr}")
+        return {"codec": None, "sample_rate": None, "channels": None, "bits_per_sample": None}
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"    FFprobe detection failed unexpectedly: {e}")
+        return {"codec": None, "sample_rate": None, "channels": None, "bits_per_sample": None}
+
+def process_audio_file_with_timestamps(file_path, timestamps, output_path):
+    """Process audio file with custom output path and timestamp list"""
+    try:
+        if not os.path.isfile(file_path):
+            pipeline_logger.error(f"    Audio file not found: {file_path}")
+            return False
+
+        pipeline_logger.info(f"    Processing audio: {os.path.basename(file_path)}")
+
+        format_info = detect_audio_format(file_path)
+        original_codec = format_info["codec"]
+        original_sr = format_info["sample_rate"]
+        original_ch = format_info["channels"]
+
+        # Load audio using pydub
+        try:
+            audio = AudioSegment.from_file(file_path)
+            # Verify loaded properties match detected ones if possible
+            if original_sr and audio.frame_rate != original_sr:
+                 pipeline_logger.warning(f"    pydub loaded SR ({audio.frame_rate}) differs from ffprobe detected SR ({original_sr}). Using loaded value.")
+            if original_ch and audio.channels != original_ch:
+                 pipeline_logger.warning(f"    pydub loaded channels ({audio.channels}) differs from ffprobe detected channels ({original_ch}). Using loaded value.")
+            sample_width = audio.sample_width
+            frame_rate = audio.frame_rate
+            channels = audio.channels
+        except Exception as e:
+            pipeline_logger.error(f"    Error loading audio file '{os.path.basename(file_path)}' with pydub: {e}")
+            return False # Fail if loading fails
+
+        max_frequency = frame_rate / 2 * 0.8
+        beep_frequency = min(350, max_frequency)
+
+        timestamps = sorted(timestamps, key=lambda x: x["start"])
+        audio_len_ms = len(audio)
+
+        for timestamp in timestamps:
+            original_start_ms = int(timestamp["start"] * 1000)
+            original_end_ms = int(timestamp["end"] * 1000)
+            buffer_ms = 100
+            start_ms = max(0, original_start_ms - buffer_ms)
+            end_ms = min(audio_len_ms, original_end_ms + buffer_ms)
+            duration_ms = end_ms - start_ms
+
+            if duration_ms <= 0:
+                continue
+
+            beep = generate_beep(
+                frequency=beep_frequency,
+                duration_ms=duration_ms,
+                sample_rate=frame_rate,
+                fade_ms=min(20, duration_ms / 5)
+            )
+
+            if channels > 1 and beep.channels == 1: beep = beep.set_channels(channels)
+            if beep.sample_width != sample_width: beep = beep.set_sample_width(sample_width)
+
+            segment_to_replace = audio[start_ms:end_ms]
+            if len(segment_to_replace) > 0:
+                try:
+                    # Use RMS for volume matching, with checks for silence
+                    if segment_to_replace.rms > 0 and beep.rms > 0:
+                        gain_db = 20 * math.log10(segment_to_replace.rms / beep.rms) # Use 20log10 for amplitude ratio
+                        gain_db = max(min(gain_db, 8), -8) # Limit gain adjustment
+                        beep = beep.apply_gain(gain_db)
+                    elif segment_to_replace.dBFS > -float('inf') and beep.dBFS > -float('inf'):
+                         # Fallback to dBFS matching if RMS is zero (silence)
+                         beep = beep.apply_gain(segment_to_replace.dBFS - beep.dBFS)
+                    
+                    # Apply additional volume reduction to make beeps quieter
+                    beep_reduction_db = -9  # Reduce beep volume by 9dB (roughly 65% quieter)
+                    beep = beep.apply_gain(beep_reduction_db)
+                    
+                except Exception as vol_err:
+                     pipeline_logger.warning(f"    Could not match volume for segment {start_ms}-{end_ms}ms: {vol_err}")
+
+            # Replace segment
+            audio = audio[:start_ms] + beep + audio[end_ms:]
+
+        # Exporting
+        export_params = {}
+        output_format = os.path.splitext(file_path)[1].lower().lstrip('.')
+
+        # Handle special codecs via ffmpeg
+        if original_codec in ["pcm_alaw", "pcm_mulaw"]:
+            temp_path = output_path + ".temp.wav"
+            try:
+                audio.export(temp_path, format="wav")
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-i", temp_path,
+                    "-c:a", original_codec,
+                    "-ar", str(frame_rate),
+                    "-ac", str(channels),
+                    output_path
+                ]
+                subprocess.run(ffmpeg_cmd, check=True, capture_output=True) # Capture output to hide ffmpeg logs unless error
+                pipeline_logger.info(f"    ✓ Re-encoded masked audio to {original_codec}")
+            except subprocess.CalledProcessError as e:
+                 pipeline_logger.error(f"    ✗ Error re-encoding to {original_codec} using ffmpeg: {e}")
+                 pipeline_logger.error(f"    FFmpeg stderr: {e.stderr.decode()}")
+                 return False
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        else:
+            # Standard pydub export
+            if not output_format or output_format not in ['wav', 'mp3', 'ogg', 'flac']:
+                output_format = 'wav' # Default to wav
+
+            if output_format == 'wav':
+                export_params = {"format": "wav"}
+            elif output_format == 'flac':
+                export_params = {"format": "flac", "parameters": ["-compression_level", "8"]}
+            elif output_format == 'mp3':
+                 export_params = {"format": "mp3", "bitrate": "320k"} # High bitrate MP3
+            else:
+                 export_params = {"format": output_format} # Use detected format
+
+            try:
+                 audio.export(output_path, **export_params)
+                 pipeline_logger.info(f"    ✓ Exported as {output_format}")
+            except Exception as export_err:
+                 pipeline_logger.error(f"    ✗ Error exporting audio to {output_format}: {export_err}")
+                 return False
+
+        return True
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"    Error processing audio file '{os.path.basename(file_path)}': {e}")
+        return False
+
+def run_mask_with_jamai_step_pipeline(
+    table_id: str,
+    tasks: List[Dict[str, Any]],
+    jamai_client: Optional[JamAI] = None
+) -> Dict[str, Any]:
+    """Process audio masking for pipeline integration.
+    
+    Args:
+        table_id: Input table ID containing timestamp data
+        tasks: List of task dictionaries with structure:
+            {
+                "taskId": str,      # Unique task identifier
+                "trackId": str,      # Track identifier
+                "srcPath": str,      # Source audio file path
+                "destPath": str,     # Destination directory for outputs
+                "status": str,       # Current status
+            }
+        jamai_client: Optional pre-configured JamAI client
+        
+    Returns:
+        Dictionary with structure:
+            {
+                "tasks": List[Dict],  # Updated tasks with status
+                "stats": {            # Processing statistics
+                    "total": int,
+                    "successful": int,
+                    "failed": int,
+                    "skipped": int,
+                    "status": str     # Overall status
+                }
+            }
+    """
+    jamai = jamai_client or JamAI(project_id=PROJECT_ID, api_base=JAMAI_API_BASE)
+    
+    pipeline_logger.info(f"Processing audio masking from table: {table_id}")
+    pipeline_logger.info(f"Tasks to process: {len(tasks)}")
+    
+    # Create a mapping of file paths to tasks for quick lookup
+    file_to_task = {task["srcPath"]: task for task in tasks if task["needs_masking"]}
+    
+    # Get all rows from the table
+    all_rows = fetch_all_rows_from_table(table_id, jamai)
+    # If no rows were found
+    if not all_rows:
+        # needs_masking > 0 but no rows that means something wrong in the pipeline
+        if len(file_to_task) > 0:
+            return {
+                "tasks": tasks,
+                "stats": {
+                    "status": "failed",
+                    "message": "No rows found in table",
+                    "total": len(tasks),
+                    "successful": 0,
+                    "failed": len(tasks),
+                    "skipped": 0
+                }
+            }
+        # needs_masking == 0 and no rows that means nothing to do
+        else:
+            return {
+                "tasks": tasks,
+                "stats": {
+                    "status": "skipped",
+                    "message": "No valid file paths found in table rows",
+                    "total": len(tasks),
+                    "successful": 0,
+                    "failed": 0,
+                    "skipped": len(tasks)
+                }
+            }
+    
+    # Group rows by file path
+    grouped_rows = group_rows_by_file(all_rows)
+    if not grouped_rows:
+        return {
+            "tasks": tasks,
+            "stats": {
+                "status": "failed",
+                "message": "No valid file paths found in table rows",
+                "total": len(tasks),
+                "successful": 0,
+                "failed": len(tasks),
+                "skipped": 0
+            }
+        }
+    
+    # Process each file
+    stats = {"successful": 0, "failed": 0, "skipped": 0}
+    
+    successfully_masked = []
+    for file_path, rows in grouped_rows.items():            
+        task = file_to_task[file_path]
+        successfully_masked.append(file_path)
+        # Process the file using the task's destPath
+        try:
+            success = process_grouped_audio_file(file_path, rows, task["destPath"])
+            
+            # Update task status based on result
+            if success:
+                task["status"] = "success"
+                task["masked_output"] = os.path.join(task["destPath"], os.path.basename(file_path))
+                stats["successful"] += 1
+            else:
+                task["status"] = "failed"
+                task["error"] = "Failed to apply masking"
+                stats["failed"] += 1
+        except Exception as e:
+            task["status"] = "failed"
+            task["error"] = f"Exception during processing: {str(e)}"
+            stats["failed"] += 1
+            pipeline_logger.opt(exception=True).error(f"Error processing {os.path.basename(file_path)}: {e}")
+    
+    # Assume whatever needs to be mask is missing == failed
+    for file_path, task in file_to_task.items():
+        if file_path not in successfully_masked:
+            task["status"] = "failed"
+            task["error"] = "Failed to apply masking"
+            stats["failed"] += 1
+
+    return {
+        "tasks": tasks,
+        "stats": {
+            "total": len(tasks),
+            "successful": stats["successful"],
+            "failed": stats["failed"],
+            "skipped": stats["skipped"],
+            "status": "failed" if stats["failed"] == len(tasks) else "completed"
+        }
+    }
+
+def _merge_timestamps(timestamps: List[Dict[str, Any]], tolerance: float = 3.5):
+    """Merge overlapping timestamps with tolerance."""
+    # Sort by start time
+    timestamps = sorted(timestamps, key=lambda x: x.get("start", 0))
+    end_offset = 0.2
+    merged = []
+    current = timestamps[0].copy()
+    
+    for i in range(1, len(timestamps)):
+        next_ts = timestamps[i]
+        current_end = current.get("end", 0)
+        next_start = next_ts.get("start", 0)
+        
+        # If current and next overlap or are adjacent (within tolerance)
+        if current_end + tolerance >= next_start:  # 2 second tolerance for adjacency
+            # Merge by taking the maximum end time
+            current["end"] = max(current_end, next_ts.get("end", 0))
+        else:
+            current["end"] += end_offset # a constant time offset to cover the trailing sound
+            merged.append(current)
+            current = next_ts.copy()
+
+    current["end"] += end_offset # a constant time offset to cover the trailing sound
+    merged.append(current)
+    return merged
+
+def process_grouped_audio_file(file_path: str, rows: List[Any], output_dir: str) -> bool:
+    """Process all phases for one audio file and save to output directory.
+    
+    Args:
+        file_path: Path to source audio file
+        rows: List of table rows for this file
+        output_dir: Directory to save masked file
+        
+    Returns:
+        True if processing succeeded, False otherwise
+    """
+    # Ensure output directory exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        pipeline_logger.info(f"Created output directory: {output_dir}")
+    pipeline_logger.info(f"\n=== Processing {os.path.basename(file_path)} ({len(rows)} phases) ===")
+    
+    all_timestamps = []
+    processed_phases = []
+    
+    # Extract timestamps from all rows for this file
+    for row in rows:
+        row_id = row.get("id", "Unknown")
+        segment_id = extract_field_value(row.get("Segment_ID", ""))
+        timestamp_data = extract_field_value(row.get("Combined"))
+        
+        if not timestamp_data:
+            pipeline_logger.info(f"  Skipping row {row_id}: No timestamp data")
+            continue
+            
+        timestamps = extract_timestamps(timestamp_data)
+        if timestamps:
+            all_timestamps.extend(timestamps)
+            processed_phases.append(segment_id)
+            pipeline_logger.info(f"  ✓ {segment_id}: {len(timestamps)} timestamps")
+        else:
+            pipeline_logger.info(f"  ✗ {segment_id}: No valid timestamps")
+    
+    if not all_timestamps:
+        pipeline_logger.info(f"  No timestamps to process for {os.path.basename(file_path)}")
+        # Copy original file to destination directory without masking
+        output_filename = os.path.basename(file_path)
+        output_path = os.path.join(output_dir, output_filename)
+        
+        try:
+            shutil.copy2(file_path, output_path)
+            pipeline_logger.info(f"  ✓ Copied original file without masking: {output_filename}")
+            return True
+        except Exception as e:
+            pipeline_logger.opt(exception=True).error(f"  ✗ Failed to copy original file: {e}")
+            return False
+    
+    # Sort timestamps to avoid conflicts
+    all_timestamps = _merge_timestamps(all_timestamps)
+    pipeline_logger.info(f"  Total timestamps to mask: {len(all_timestamps)}")
+    
+    # Generate output path (same filename, different directory)
+    output_filename = os.path.basename(file_path)
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Process the audio file
+    success = process_audio_file_with_timestamps(file_path, all_timestamps, output_path)
+    
+    if success:
+        pipeline_logger.info(f"  ✓ Saved: {output_filename}")
+    else:
+        pipeline_logger.error(f"  ✗ Failed to process: {os.path.basename(file_path)}")
+    
+    return success
+
+# --- 7. Main Execution ---
+def main():
+    try:
+        pipeline_logger.info("\n" + "="*60)
+        pipeline_logger.info("AUDIO MASKING V2 - MULTIPLE PHASES PER FILE")
+        pipeline_logger.info("="*60)
+        
+        stats = run_mask_with_jamai_step(
+            input_table=args.input_table,
+            output_dir=args.output_dir,
+            file_limit=args.limit
+        )
+        
+        pipeline_logger.info("\n" + "="*60)
+        pipeline_logger.info("PROCESSING COMPLETE")
+        pipeline_logger.info("="*60)
+        pipeline_logger.info(f"Files processed: {stats['total_files']}")
+        pipeline_logger.info(f"Successful: {stats['successful']}")
+        pipeline_logger.info(f"Failed: {stats['failed']}")
+        pipeline_logger.info(f"Output directory: {args.output_dir}")
+        pipeline_logger.info("="*60)
+        
+    except Exception as e:
+        pipeline_logger.opt(exception=True).error(f"\nFATAL ERROR during processing: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(
+        description="Apply audio masking (beeps) to sensitive timestamps from JamAI table."
+    )
+    parser.add_argument("--input-table", default=None, 
+        help=f"Specify exact input table name (e.g., {INPUT_TABLE_PREFIX}YYYYMMDD_HHMMSS). Default: latest table")
+    parser.add_argument("--limit", type=int, default=None, 
+        help="Limit number of audio files to process. Default: process all")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, 
+        help=f"Directory for masked files. Default: {DEFAULT_OUTPUT_DIR}")
+
+    args = parser.parse_args()
+
+    # Set global variables from args
+    input_table = args.input_table
+    limit = args.limit
+    output_dir = args.output_dir
+
+    # --- Output Directory Setup ---
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir)
+            pipeline_logger.info(f"Created output directory: {output_dir}")
+        except OSError as e:
+            pipeline_logger.error(f"✗ FATAL ERROR: Could not create output directory '{output_dir}': {e}")
+            sys.exit(1)
+    else:
+        pipeline_logger.info(f"Using existing output directory: {output_dir}")
+
+    main()

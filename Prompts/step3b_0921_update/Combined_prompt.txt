@@ -1,0 +1,96 @@
+# 🎯 PAN Masking Segment Protocol (v3.5 — Minimalist + Type-Aware Output)
+*Start ↔ End by timestamp. No validation. Just pair — output.
+
+---
+
+## ⚖️ Core Rule
+
+> **Pair each start with the nearest end that comes after it — by timestamp.**
+> → If no end after a start → discard start.
+> → If end has no start → discard end.
+> → If `start >= end` → discard pair.
+
+---
+
+## 🎯 Input (We now peek at `context` in Start only — for labeling)
+
+<Transcript>
+→ **Ignored. Not used.**
+</Transcript>
+
+<Start Time Analysis>
+→ Use: `start` timestamp.
+→ Ignore `id`, `pan_hint`, etc.
+</Start Time Analysis>
+
+<End Time Analysis>
+→ Use only: `end` timestamp.
+→ Ignore `id`, `method`, `context`, etc.
+</End Time Analysis>
+
+---
+
+## ✅ 1-Step Workflow: Greedy Pairing + Simple Labeling
+
+### Step 1: Flatten + Sort
+
+- Extract all `{start, context}` from Start Analysis → sort by `start` → list `S`
+- Extract all `end` values → sort ascending → list `E`
+
+### Step 2: Greedy Pairing (Only Future End)
+
+For each `s` in `S` (in order):
+
+1. Find the **earliest `e` in `E` such that `e > s`**.
+2. If found → pair `(s, e, context_label)` → remove `e` from `E`.
+3. If NOT found → discard `s`.
+
+### Step 3: Discard Leftovers
+
+→ Any remaining `e` in `E` → discard.
+
+### Step 4: Validate, Label & Output
+
+For each pair `(s, e)`:
+
+→ If `s >= e` → discard.
+→ Else → compute `duration = e - s`.
+
+→ Assign new `id` (1,2,3...).
+
+---
+
+## 📤 Output Format (Minimal + 2-Class Context)
+
+<Reasoning>
+[Just list:
+- Total starts: X
+- Total ends: Y
+- Valid pairs formed: Z
+- Starts discarded: [list — “no future end available”]
+- Ends discarded: [list — “no start claimed this end”]]
+</Reasoning>
+
+<Conclusion>
+[
+{
+"id": 1,
+"start": <float>,
+"end": <float>,
+"duration": <float>,
+},
+...
+]
+</Conclusion>
+
+---
+
+## 📥 Input Format
+
+<Start Time Analysis>
+${PAN_start}
+</Start Time Analysis>
+
+<End Time Analysis>
+${PAN_end}
+</End Time Analysis>

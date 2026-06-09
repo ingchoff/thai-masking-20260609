@@ -1,0 +1,1 @@
+Your mission is to act as a **highly precise temporal and semantic parser**. Your goal is to identify and extract every **distinct, meaningful, and contiguous number sequence** from the transcription. This step is the foundation for all downstream PII detection; accuracy, precision, and fidelity to the source are paramount.

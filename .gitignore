@@ -1,0 +1,11 @@
+transcription/
+transcription_CSH_SH_v3/
+transcription_SEG_wave2/
+transcription_SEG_wave2_v2/
+transcriptionold/
+.swp
+*.pyc
+.env
+logs/
+.venv/
+db/

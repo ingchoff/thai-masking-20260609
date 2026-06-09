@@ -1,0 +1,537 @@
+"""
+Step 3 of masking pipeline: Process timestamp data from input tables.
+Single-file refactor – 100 % functional parity.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import json5
+import os
+import re
+import sys
+import traceback
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import tiktoken
+from dotenv import load_dotenv
+from jamaibase import JamAI, protocol as p
+from jamaibase.exceptions import JamaiException, ResourceNotFoundError
+
+# --------------------------------------------------------------------------- #
+# 0. Bootstrap logging
+# --------------------------------------------------------------------------- #
+try:
+    from Masking.logging_utils import LOGGER as _BASE_LOGGER
+except ImportError:
+    from logging_utils import LOGGER as _BASE_LOGGER
+
+
+_LOG = _BASE_LOGGER.bind(type="pipeline", service_name="get_timestamps")
+
+# --------------------------------------------------------------------------- #
+# 1. Pure configuration object
+# --------------------------------------------------------------------------- #
+load_dotenv()
+
+class _Config:
+    """Immutable configuration built once from env + CLI overrides."""
+    __slots__ = (
+        "project_id",
+        "api_base",
+        "step2_prefix",
+        "out_schema_id",
+        "out_prefix",
+        "context_limit",
+        "fetch_limit",
+        "default_fetch_limit",
+        "particles",
+        "thai_digits",
+        "card_terms",
+        "keywords_to_track",
+    )
+
+    def __init__(self, cli: Optional[argparse.Namespace] = None) -> None:
+        self.project_id: str = os.getenv("PROJECT_ID", "proj_d51957697af3bcec339092cb")
+        self.api_base: str = os.getenv("JAMAI_API_BASE", "http://localhost:6969/api")
+        self.step2_prefix = "step2b_"
+        self.out_schema_id = "step3"
+        self.out_prefix = "step3_"
+        self.context_limit: int = int(os.getenv("MODEL_CONTEXT_LIMIT", "32000"))
+        self.fetch_limit: int = 100
+        self.default_fetch_limit = 100
+        
+        # Keyword lists for timestamp injection
+        self.particles = ["ครับ", "ค่ะ", "คะ", "คับ", "นะ", "นะครับ", "นะคะ", "จ้ะ", "จ้า", "หน่อย", "สิ", "เถอะ", "แหละ", "หรอก", "ฮะ", "วะ", "ขอรับ", "เพคะ"]
+        self.thai_digits = ["ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        self.card_terms = [
+            # Individual important terms
+            "บัตร",
+            "เครดิต", 
+            "เดบิต",
+            "รหัส",
+            "หมดอายุ",
+            "วีซ่า",
+            "มาสเตอร์",
+            # Compound terms
+            "บัตรเครดิต", 
+            "บัตรเดบิต", 
+            "เลขบัตร", 
+            "รหัสบัตร", 
+            "หมดอายุบัตร", 
+            "ทับ", 
+            "เอ็กซ์ไพรี่", 
+            "ซีวีวี",
+            # English terms
+            "call center",
+            "center"
+        ]
+        # For this specific use case, we only care about the card terms
+        self.keywords_to_track = self.card_terms
+        
+        if cli:
+            # CLI overrides
+            self.context_limit = cli.context_limit
+
+CFG = _Config()  # default instance; CLI will mutate below
+
+# --------------------------------------------------------------------------- #
+# 2. Shared helpers
+# --------------------------------------------------------------------------- #
+_TOKENIZER = tiktoken.get_encoding("o200k_base")
+
+def _count_tokens(text: str | None) -> int:
+    if not text:
+        return 0
+    try:
+        return len(_TOKENIZER.encode(text))
+    except Exception:
+        return len(text or "") // 4  # fallback
+
+def _extract_value(field: Any) -> Any:
+    return field.get("value") if isinstance(field, dict) else field
+
+def _safe_json(text: str) -> Any:
+    if not text:
+        return None
+    # 1. Try to extract <JSON>…</JSON> first
+    m = re.search(r"<JSON>([\s\S]*?)</JSON>", text, re.I)
+    payload = m.group(1) if m else text.strip()
+
+    # 2. Parse with JSON5
+    try:
+        return json5.loads(payload)
+    except Exception as e:
+        _LOG.error(f"Failed to parse JSON: {m}, err: {str(e)}")
+        return None
+
+
+def _parse_ts(table_id: str, prefix: str) -> str | None:
+    if not table_id.startswith(prefix):
+        return None
+    ts = table_id[len(prefix) :]
+    try:
+        datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        return ts
+    except ValueError:
+        return None
+
+
+def generate_final_transcript_string(
+    segments: list,
+    keywords: list,
+    digits: list = None,
+    merge_gap_tolerance: float = 0.01
+) -> str:
+    """
+    Generates a final, cleaned, and timestamp-injected transcript string by
+    reconstructing text from character-level tokens and using a character-to-time map.
+    
+    This function handles ASR systems that output character-level tokens by:
+    1. Merging adjacent segments from the same speaker to create coherent turns.
+    2. Reconstructing full text from character-level tokens.
+    3. Using regex to find keywords and digit sequences in the full text.
+    4. Mapping matches back to precise character-level timing data.
+
+    Args:
+        segments (list): The raw list of segment dictionaries, each with a 'words' list.
+        keywords (list): A list of keywords to highlight with timestamps.
+        digits (list): A list of digit words to detect as sequences.
+        merge_gap_tolerance (float): The maximum time gap (in seconds) between segments
+                                     to be considered for merging.
+
+    Returns:
+        str: A multi-line string representing the final, formatted conversation.
+    """
+    if not segments:
+        return ""
+    
+    if digits is None:
+        digits = CFG.thai_digits
+
+    # --- Part 1: Merge Segments (Logic adapted from ThaiTranscriptCleaner) ---
+    from collections import defaultdict
+    
+    # Group segments by speaker
+    speaker_segments = defaultdict(list)
+    for seg in sorted(segments, key=lambda x: x.get("start", 0)):
+        speaker_segments[seg.get("channel", "Unknown")].append(seg)
+
+    merged_segments = []
+    for speaker, segs_by_speaker in speaker_segments.items():
+        if not segs_by_speaker:
+            continue
+        
+        # Use deepcopy to create a fully independent copy
+        current_turn = copy.deepcopy(segs_by_speaker[0])
+        
+        for next_seg in segs_by_speaker[1:]:
+            gap = next_seg.get("start", 0) - current_turn.get("end", 0)
+            if gap <= merge_gap_tolerance:
+                # Merge
+                current_turn["end"] = max(next_seg.get("end", 0), current_turn.get("end", 0))
+                if "words" in next_seg:
+                    current_turn.setdefault("words", []).extend(next_seg.get("words", []))
+            else:
+                # Finish current turn and start a new one
+                merged_segments.append(current_turn)
+                current_turn = copy.deepcopy(next_seg)
+        
+        merged_segments.append(current_turn) # Add the last turn
+
+    # Sort all final turns by start time
+    merged_segments.sort(key=lambda x: x.get("start", 0))
+
+    # --- Part 2: NEW Character-Mapping and Regex-Based Formatting ---
+    output_lines = []
+    
+    # Prepare regex patterns
+    # Sort keywords by length to match longer ones first (e.g., "บัตรเครดิต" before "บัตร")
+    keyword_pattern = "|".join(re.escape(kw) for kw in sorted(keywords, key=len, reverse=True))
+    digit_pattern = "|".join(re.escape(d) for d in digits)
+    # A sequence of one or more digits, separated by optional spaces
+    digit_sequence_pattern = f"(?:(?:{digit_pattern})\\s*)+"
+    
+    # Combined pattern to find either a keyword or a digit sequence
+    combined_pattern = re.compile(f"({keyword_pattern}|{digit_sequence_pattern})", re.IGNORECASE)
+
+    for turn in merged_segments:
+        seg_start = turn.get("start", 0.0)
+        seg_end = turn.get("end", 0.0)
+        channel = turn.get("channel", "Unknown")
+        words = turn.get("words", []) # These are actually characters
+        if not words:
+            continue
+
+        # Step A: Reconstruct full text and create the character-to-time map
+        full_text = ""
+        char_map = {} # Maps index in full_text to the original word/char info
+        for char_info in words:
+            char_token = char_info.get("word", "")
+            if char_token: # Ignore empty tokens
+                char_map[len(full_text)] = char_info
+                full_text += char_token
+        
+        # Step B: Find all matches in the reconstructed text
+        matches = list(combined_pattern.finditer(full_text))
+        
+        # Step C: Build the new string from pieces
+        new_text_parts = []
+        last_index = 0
+        
+        for match in matches:
+            match_start_idx, match_end_idx = match.span()
+            
+            # 1. Append the plain text before this match
+            new_text_parts.append(full_text[last_index:match_start_idx])
+            
+            # 2. Get timing info from the map
+            # Find the first valid start index in the map
+            first_char_info_idx = match_start_idx
+            while first_char_info_idx not in char_map and first_char_info_idx < match_end_idx:
+                first_char_info_idx += 1
+            
+            # Find the last valid end index in the map
+            last_char_info_idx = match_end_idx - 1
+            while last_char_info_idx not in char_map and last_char_info_idx > match_start_idx:
+                last_char_info_idx -= 1
+
+            if first_char_info_idx in char_map and last_char_info_idx in char_map:
+                start_time = char_map[first_char_info_idx].get('start', 0.0)
+                end_time = char_map[last_char_info_idx].get('end', 0.0)
+                
+                # 3. Append the formatted, timestamped match
+                matched_text = match.group(0).strip()
+                formatted_match = f"({start_time:.2f}){matched_text}({end_time:.2f})"
+                new_text_parts.append(formatted_match)
+            else:
+                # Fallback if timing info can't be found (should not happen)
+                new_text_parts.append(match.group(0))
+
+            last_index = match_end_idx
+            
+        # 4. Append any remaining text after the last match
+        new_text_parts.append(full_text[last_index:])
+        
+        enhanced_text = "".join(new_text_parts)
+        enhanced_text = re.sub(r'\s+', ' ', enhanced_text).strip()
+        
+        timestamp_range = f"[{seg_start:.2f} --> {seg_end:.2f}]"
+        speaker_label = f"[{channel}]"
+        output_lines.append(f"{timestamp_range} {speaker_label}: {enhanced_text}")
+
+    return "\n".join(output_lines)
+
+# --------------------------------------------------------------------------- #
+# 3. JamAI table discovery
+# --------------------------------------------------------------------------- #
+class _TableResolver:
+    """Handles all table-id resolution and creation."""
+    def __init__(self, jamai: JamAI) -> None:
+        self.jamai = jamai
+
+    def discover(
+        self,
+        step2_override: Optional[str],
+    ) -> Tuple[str, str]:
+        # ---------- step2 ----------
+        if step2_override:
+            step2_id = step2_override
+            ts = _parse_ts(step2_id, CFG.step2_prefix) or datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            step2_id, ts = self._latest(CFG.step2_prefix)
+            if not step2_id:
+                raise ResourceNotFoundError(f"No table with prefix '{CFG.step2_prefix}'")
+        # ---------- output ----------
+        out_id = f"{CFG.out_prefix}{ts}"
+        self._setup_output(out_id)
+        return step2_id, out_id
+
+    # ---------------- internal ---------------- #
+    def _latest(self, prefix: str) -> Tuple[str | None, str | None]:
+        tables = self.jamai.table.list_tables(table_type=p.TableType.action).items
+        candidates = [
+            (datetime.strptime(ts, "%Y%m%d_%H%M%S"), tbl.id, ts)
+            for tbl in tables
+            if (ts := _parse_ts(tbl.id, prefix))
+        ]
+        if not candidates:
+            return None, None
+        _, tbl_id, ts = max(candidates, key=lambda x: x[0])
+        return tbl_id, ts
+
+    def _ensure_exists(self, table_id: str) -> None:
+        try:
+            self.jamai.table.get_table(table_type=p.TableType.action, table_id=table_id)
+        except ResourceNotFoundError:
+            raise ResourceNotFoundError(f"Step 1 table '{table_id}' not found")
+
+    def _setup_output(self, out_id: str) -> None:
+        self.jamai.table.get_table(table_type=p.TableType.action, table_id=CFG.out_schema_id)
+        try:
+            self.jamai.table.delete_table(table_type=p.TableType.action, table_id=out_id)
+        except ResourceNotFoundError:
+            pass
+        self.jamai.table.duplicate_table(
+            table_type=p.TableType.action,
+            table_id_src=CFG.out_schema_id,
+            table_id_dst=out_id,
+            include_data=False,
+        )
+
+# --------------------------------------------------------------------------- #
+# 4. Business logic – pure functions
+# --------------------------------------------------------------------------- #
+class _Logic:
+    """All data transformation without side effects."""
+
+    # ---------- segment filtering by time ----------
+    @staticmethod
+    def overlapping_segments(segments_raw: Any, start: float, end: float) -> List[Dict]:
+        if isinstance(segments_raw, str):
+            segments = _safe_json(segments_raw)
+        elif isinstance(segments_raw, list):
+            segments = segments_raw
+        else:
+            segments = None
+        if not isinstance(segments, list):
+            return []
+        return [
+            s
+            for s in segments
+            if isinstance(s, dict)
+            and (s.get("start", 0) < end and s.get("end", 0) > start)
+        ]
+
+
+# --------------------------------------------------------------------------- #
+# 5. Orchestration
+# --------------------------------------------------------------------------- #
+class _Processor:
+    def __init__(self, jamai: JamAI) -> None:
+        self.jamai = jamai
+        self.resolver = _TableResolver(jamai)
+
+    def run(
+        self,
+        *,
+        step2: Optional[str],
+        context_limit: int,
+        row_limit: Optional[int],
+    ) -> str:
+        step2_id, out_id = self.resolver.discover(step2)
+        input_table = self.jamai.table.get_table(table_type=p.TableType.action, table_id=step2_id)
+        rows_total = 0
+        limit = row_limit if row_limit is not None else float("inf")
+
+        total_rows = input_table.num_rows
+        offset = 0
+        _row_num = 0
+        all_rows: list[dict[str, Any]] = []
+        while _row_num < total_rows:
+            step2_rows = self.jamai.table.list_table_rows(
+                table_type=p.TableType.action,
+                table_id=step2_id,
+                columns=[
+                    "file_path",
+                    "Segment_ID",
+                    "Transcription",
+                    "SegmentsAndWords",
+                ],
+                limit=CFG.default_fetch_limit,
+                offset=offset,
+            )
+            all_rows.extend(step2_rows.items)
+            offset += len(step2_rows.items)
+            _row_num += len(step2_rows.items)
+        grouped = {}
+        for r in all_rows:
+            key = _extract_value(r.get("file_path"))
+            if key:
+                grouped.setdefault(key, []).append(r)
+        _LOG.info(f"Found {len(grouped)} unique file groups to process.")
+        for idx, (row_key, chunk_rows) in enumerate(grouped.items(), 1):
+            if rows_total >= limit:
+                _LOG.info("Row limit reached")
+                break
+            try:
+                self._process_group(row_key, chunk_rows, out_id, context_limit)
+            except Exception as e:
+                _LOG.error(f"Error processing group {row_key}: {e}")
+                _LOG.error(traceback.format_exc())
+            rows_total += 1
+        return out_id
+
+    # ---------- per group ----------
+    def _process_group(
+        self,
+        row_key: str,
+        rows: List,
+        out_id: str,
+        context_limit: int,
+    ) -> None:
+        _LOG.info(f"Processing group {row_key}")
+        first = rows[0]
+        file_path = _extract_value(first.get("file_path"))
+
+        phases_raw = None
+        payloads = []
+        for r in rows:
+            if seg_id := _extract_value(r.get("Segment_ID")):
+                phase = _safe_json(seg_id)
+            if not phase:
+                continue
+            
+            if not _extract_value(phase.get("include_PAN")):
+                _LOG.info(f"No PAN phases for phase id: {_extract_value(phase.get('index'))}")
+                continue
+
+            seg_data = _extract_value(r.get("SegmentsAndWords"))
+            segs = _Logic.overlapping_segments(seg_data, phase["start_time"], phase["end_time"])
+            if not segs:
+                continue
+            
+            # Generate final transcript string with merged segments and keyword timestamps
+            final_cleaned = generate_final_transcript_string(
+                segments=segs,
+                keywords=CFG.keywords_to_track,
+                digits=CFG.thai_digits
+            )
+            
+            payload = {
+                "file_path": file_path,
+                "Explain": f"Phase {phase['index']}: {phase['description']}",
+                "Segment_ID": f"Phase_{phase['index']}_{phase['phase']}",
+                "Transcription": _extract_value(r.get("Transcription")),
+                "SegmentsAndWords": final_cleaned,
+            }
+            payloads.append(payload)
+        if len(payloads) > 0:
+            self.jamai.table.add_table_rows(
+                table_type=p.TableType.action,
+                request=p.RowAddRequest(table_id=out_id, data=payloads, stream=False),
+            )
+
+# --------------------------------------------------------------------------- #
+# 6. Public API (unchanged signatures)
+# --------------------------------------------------------------------------- #
+def run_get_ts_step_pipeline(
+    tasks: List[Dict[str, Any]],
+    input_table_step2: Optional[str] = None,
+    context_limit: int = CFG.context_limit,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None,
+) -> Dict[str, Any]:
+    try:
+        jamai = jamai_client or JamAI(project_id=CFG.project_id, api_base=CFG.api_base)
+        processor = _Processor(jamai)
+        table_id = processor.run(
+            step2=input_table_step2,
+            context_limit=context_limit,
+            row_limit=row_limit,
+        )
+        return {"tasks": tasks, "table_id": table_id, "stats": {"status": "success", "message": "Success"}}
+    except Exception as e:
+        return {"tasks": tasks, "table_id": None, "stats": {"status": "failed", "message": str(e)}}
+
+def run_get_ts_step(
+    input_table_step2: Optional[str] = None,
+    context_limit: int = CFG.context_limit,
+    row_limit: Optional[int] = None,
+    jamai_client: Optional[JamAI] = None,
+) -> str:
+    jamai = jamai_client or JamAI(project_id=CFG.project_id, api_base=CFG.api_base)
+    return _Processor(jamai).run(
+        step2=input_table_step2,
+        context_limit=context_limit,
+        row_limit=row_limit,
+    )
+
+# --------------------------------------------------------------------------- #
+# 7. CLI (unchanged)
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Fetch detailed segments based on phase analysis, process/reduce them, and upload to a timestamped output table."
+    )
+    parser.add_argument("--input-table-step2", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--context-limit", type=int, default=CFG.context_limit)
+    args = parser.parse_args()
+
+    # update global config with CLI values
+    CFG = _Config(args)
+
+    try:
+        tid = run_get_ts_step(
+            input_table_step2=args.input_table_step2,
+            context_limit=args.context_limit,
+            row_limit=args.limit,
+        )
+        _LOG.info(f"Finished. Output table: {tid}")
+    except Exception as e:
+        _LOG.error(str(e))
+        sys.exit(1)

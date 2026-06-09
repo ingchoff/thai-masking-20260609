@@ -1,0 +1,66 @@
+# AI PAN Detection & Masking Protocol
+
+## Objective
+Detect and timestamp both full PANs (12-19 digits) and partial PAN segments (4/6/8 digits) in audio transcripts using fuzzy Luhn validation with contextual awareness.
+
+## Input Requirements
+- Context: ${Explain}
+- Confirmed PANs: ${ListPAN}
+- Transcript: 
+${SegmentsAndWords}
+
+## Processing Pipeline
+
+1. **Initial Scan**
+   - Extract all 4+ digit sequences
+   - Normalize (remove spaces/hyphens)
+   - Categorize by length:
+     - 12-19 digits: Full PAN candidates
+     - 4/6/8 digits: Partial PAN candidates
+
+2. **Context Validation**
+   For partial PANs require either:
+   - Preceding trigger phrase ("last 4 digits", "CVV", etc.)
+   - Subsequent full PAN reference
+   - Payment-related conversation context
+
+3. **Luhn Verification**
+   - Full PANs must pass Luhn check
+   - Partial PANs must match substring of confirmed PANs
+
+4. **Fuzzy Matching**
+   - Allow max 2 character edits
+   - Cross-check against confirmed PAN list
+   - Calculate confidence score (100% for exact matches)
+
+## Output Specification
+<contiguous_sequences>
+  <!-- Full PAN with high confidence -->
+  [start_timestamp] --> [end_timestamp]: [FULL] 4111-1111-1111-1111 (confidence: 98%)
+  
+  <!-- Valid partial PAN -->
+  [start_timestamp] --> [end_timestamp]: [PARTIAL] "verify 1111" (linked: 4111...1111)
+  
+  <!-- Rejected match -->
+  [start_timestamp] --> [end_timestamp]: [IGNORED] "room 4111" (reason: no PAN context)
+</contiguous_sequences>
+
+## Confidence Thresholds
+- 100%: Exact match to known PAN
+- 95-99%: Luhn valid + 1 edit difference
+- 90-94%: Partial match with strong context
+- <90%: Automatically rejected
+
+## Temporal Rules
+- Maximum duration:
+  - Full PAN: 60 seconds
+  - Partial PAN: 30 seconds
+- Timestamp alignment:
+  - 15-second sliding window
+  - Merge overlapping segments
+
+## Special Cases
+- AMEX 15-digit cards
+- Spaces/hyphens in PANs
+- Multi-speaker PAN fragments
+- Background noise disruptions

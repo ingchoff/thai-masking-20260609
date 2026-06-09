@@ -1,0 +1,158 @@
+# ✅ **Number Context Identifier (Thai Audio Transcript)**
+## 🎯 **Your Job**
+Identify and document **contexts where sensitive numbers are mentioned** in the Thai audio transcript below.
+**Focus exclusively on segments containing actual digits (Thai number words or Arabic digits).**
+**Skip segments without any numbers - only analyze segments with sensitive numerical information.**
+
+---
+
+## 🔥 **THE MOST IMPORTANT RULE: Context Completeness & Digit Presence**
+The `"context"` field **MUST** contain **a complete description** of what the number represents and the situation around it.
+**EVERY output segment MUST contain at least one digit (Thai number word or Arabic digit).**
+**If you break this rule, your entire output fails.**
+
+| ✅ **GOOD CONTEXT** | ❌ **POOR CONTEXT** |
+|-------------------|-------------------|
+| `"Customer providing their 16-digit card number for verification"` | `"Number sequence"` |
+| `"Agent asking for the last 4 digits of customer's ID card"` | `"ID number"` |
+| `"Customer stating their postal code for address verification"` | `"Postal code"` |
+| `"Agent providing customer service phone number"` | `"Phone number"` |
+
+> 🚨 **CRITICAL**: If the `"context"` field is **vague or incomplete** OR the segment **contains no digits**, **DISCARD THE ENTRY**.
+
+---
+
+## 📋 **Your 6-Step Process (Follow Every Time)**
+1. **🔍 SCAN:** Read through the transcript. Identify **only segments containing actual digits**:
+- Look for Thai number words (หนึ่ง, สอง, etc.) and Arabic digits (0, 1, 2, etc.)
+- **Completely skip segments without any numbers**
+
+2. **🔗 GROUP:** For each segment with numbers:
+- Include the number mentioned and surrounding context
+- Include words that explain what the number represents
+- The segment ENDS when:
+- The topic completely changes
+- A different number is introduced for a different purpose
+- A speaker change occurs with a new topic
+
+3. **📝 DESCRIBE CONTEXT:** For each number segment, write a clear description:
+- Who is mentioning the number (Agent or Customer)
+- What the number represents (card number, ID, postal code, etc.)
+- Why the number is being mentioned (verification, providing information, etc.)
+- Be specific and complete in your description
+
+4. **⏱️ SET TIMESTAMPS:**
+- Use the **segment timestamps** `[100.0 --> 110.0]` from the transcript
+- `start` = start time of the segment where the number is mentioned
+- `end` = end time of the segment where the number is mentioned
+
+5. **🏷️ ASSIGN TAGS:** Check the context and add **all** that apply:
+- `"CARD-RELATED"`: Context involves credit/debit/member cards
+- `"EXPIRY-DATE"`: Expiry date for credit/debit/member cards
+- `"NATIONAL-ID"`: Context involves National identification, Citizen ID, "บัตรบาลชน"
+- `"CONTACT-INFORMATION"`: Context involves phone numbers, addresses
+- `"FINANCIAL"`: Context involves amounts, prices, payments, but not card details (should already assigned "CARD-RELATED").
+- `"OTHER"`: None of the above
+
+6. **✅ VALIDATE:** Check your context description against the Final Checklist below.
+
+---
+
+## 📚 **Learn from These Examples (What NOT to do vs. What TO do)**
+
+### ❌ **Example 1: Including Segments Without Numbers**
+* **Transcript Snippet:** `"[1122.27 --> 1123.91] [Caller]: ังหวัด สมุทร สาคร ค่ะ"`
+* **❌ WRONG:**
+`{"id":10,"start":1122.27,"end":1123.91,"context":"Customer providing their province name (Samut Sakhon) for address verification","speaker":"Caller","tags":["CONTACT-INFORMATION"]}`
+_Why it's wrong:_ No actual digits mentioned in this segment. Should be skipped.
+* **✅ CORRECT:**
+*(No output for this segment - no digits present)*
+
+---
+
+### ❌ **Example 2: Including Segments Without Numbers (Place Names)**
+* **Transcript Snippet:** `"[1115.02 --> 1117.18] [Caller]: ่อ กัมพูนาดี อ"`
+* **❌ WRONG:**
+`{"id":8,"start":1115.02,"end":1119.20,"context":"Customer providing their subdistrict name (Nadai) for address verification","speaker":"Caller","tags":["CONTACT-INFORMATION"]}`
+_Why it's wrong:_ No actual digits mentioned in this segment. Should be skipped.
+* **✅ CORRECT:**
+*(No output for this segment - no digits present)*
+
+---
+
+### ❌ **Example 3: Vague Context Description**
+* **Transcript Snippet:** `"[89.92 --> 94.70] [Caller]: ็น ห้า เจ็ด หนึ่ง ห้สอง หนึ่ง สาม เก้า อ"`
+* **❌ WRONG:**
+`{"context": "Customer saying numbers"}`
+_Why it's wrong:_ Too vague. Doesn't explain what the numbers represent.
+* **✅ CORRECT:**
+`{"id":1,"start":89.92,"end":94.70,"context":"Customer providing their card number digits (5,7,1,2,1,3,9) for verification","speaker":"Caller","tags":["CARD-RELATED"]}`
+_Why it's right:_ Explains what the numbers are and why they're being provided.
+
+---
+
+### ❌ **Example 4: Missing Important Details**
+* **Transcript Snippet:** `"[104.49 --> 121.26] [Agent]: อ๋อถ้าเกิดถามทางเราเนี้ยก็สามารถถามไปทั้งทุกท่องแพลตฟอร์มเลยครับ ก็คือทั้งทั้งไลน์เฟซบุ๊กเว็บไซต์เรามีหมดนะครับหรือว่าจะโทร โทรศัพท์ที่ผมเคยแจ้งไปนะครับก็จะเป็นตัวอ่าหมายเลขศูนย์สองหนึ่งสองสามสี่ห้าหกเจ็ดได้ตลอดยีบสี่ชั่วโมงเลยครับ อันนี้ซับถามได้ครับผมอ่าอ่า อ่า อ่า อ่า อ่า อ่า อ่า อ่า"`
+* **❌ WRONG:**
+`{"context": "Agent giving phone number"}`
+_Why it's wrong:_ Missing key details about the number's purpose and availability.
+* **✅ CORRECT:**
+`{"id":1,"start":104.49,"end":121.26,"context":"Agent providing customer service phone number (021234567) available 24 hours for inquiries across all platforms including Line, Facebook, and website","speaker":"Agent","tags":["CONTACT-INFORMATION"]}`
+_Why it's right:_ Includes the complete phone number, its purpose, availability, and contact channels.
+
+---
+
+### ❌ **Example 5: Correctly Including Only Segments With Digits**
+* **Transcript Snippet:** `"[1104.04 --> 1107.12] [Caller]: ึ่ง หนึ่ง สอง เจ็ด ครับ หนึ่ง เก้า ศูนย์ จ"`
+* **✅ CORRECT:**
+`{"id":6,"start":1104.04,"end":1107.12,"context":"Customer providing their house number (127) and postal code (190) for address verification","speaker":"Caller","tags":["CONTACT-INFORMATION"]}`
+_Why it's right:_ Includes only segments with actual digits (หนึ่ง, หนึ่ง, สอง, เจ็ด, หนึ่ง, เก้า, ศูนย์).
+
+---
+
+### Example 6: assigning "NATIONAL-ID" based on context
+* **Transcript Snippet:** `"[542.35--> 550.14] [Caller]:120714014573"`
+`"[550.35--> 557.87] [Agent]:คุณลูกค้าครับ ขึ้นต้นด้วย 1 แล้วมีแค่ 12 หลัก รบกวนเช็คให้ครบ 13 หลักด้วยครับ"`
+* **✅ CORRECT:**
+`{"id":6,"start":542.35,"end":550.14,"context":"Customer providing a 12 digits number which could be a partial credit card, but later on Agent replied with a confirmation that it's missing 1 digit, so 13 digits are expected which is a strong indication that this is a national-id.","speaker":"Caller","tags":["NATIONAL-ID"]}`
+_Why it's right:_Agent expectation is a 13 digits card number which is exactly a Thai National-ID.
+
+---
+
+## ✅ **Final Checklist (MUST PASS ALL)**
+Before you output an entry, **check every box**. If any box is unchecked, **DISCARD THE ENTRY**.
+- [x] **Contains Numbers:** Segment MUST include actual digits (Thai number words or Arabic digits)
+- [x] **Completeness:** `"context"` fully explains what the number represents and why it's mentioned
+- [x] **Relevance:** The context is actually about the numbers mentioned, not just general conversation
+- [x] **Accuracy:** The context description correctly interprets the situation in the transcript
+- [x] **Speaker Identification:** Correctly identifies who is mentioning the number
+- [x] **Appropriate Tags:** Tags accurately reflect the type of context
+- [x] **Timestamp Accuracy:** Timestamps correctly cover the segment where the number context appears
+- [x] **No Duplicates:** Not repeating the same context with slightly different wording
+- [x] **No Hallucination:** The context actually exists in the transcript
+
+---
+
+## 📥 **Output Format (STRICT: JSON Lines)**
+Output **one JSON object per line**.
+Each object must have these keys:
+- `"id"`: integer starting at 1
+- `"start"`: float, start time from the segment
+- `"end"`: float, end time from the segment
+- `"context"`: string, complete description of what the number represents and the situation
+- `"speaker"`: `"Caller"` or `"Agent"`
+- `"tags"`: list of one or more from:
+- `"CARD-RELATED"` → context involves credit/debit/member cards
+- `"EXPIRY-DATE"` →  Expiry date for credit/debit/member cards
+- `"NATIONAL-ID"` → context involves National identification, Citizen ID, "บัตรบาลชน"
+- `"CONTACT-INFORMATION"` → context involves phone numbers, addresses
+- `"FINANCIAL"` → context involves amounts, prices, payments
+- `"OTHER"` → all others.
+
+> ✅ **Example:**
+> `{"id":1,"start":89.92,"end":94.70,"context":"Customer providing their card number digits (5,7,1,2,1,3,9) for verification","speaker":"Caller","tags":["CARD-RELATED"]}`
+
+**No explanations, no text before or after. STOP after the last sequence.**
+<transcription>
+${SegmentsAndWords}
+</transcription>
