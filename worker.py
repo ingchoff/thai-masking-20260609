@@ -269,80 +269,94 @@ def main():
     Polls the database for pending jobs and processes them in batches.
     """
     logger.info("Starting audio masking worker")
-    
-    last_process_time = 0
-    
-    while True:
-        # Check if shutdown is requested
-        with shutdown_lock:
-            if shutdown_requested:
-                logger.info("Shutting down gracefully")
-                break
-        
-        try:
-            current_time = time.time()
-            time_since_last_process = current_time - last_process_time
-            
-            # Get queue stats to check pending job count
-            stats_all = get_queue_stats()
-            stats_transcription = get_queue_stats(job_type="transcription")
-            stats_transcription_secondary = get_queue_stats(job_type="transcription_secondary")
-            pending_count = stats_all['pending']
-            running_count = stats_all['running']
-            transcription_pending = stats_transcription['pending']
-            transcription_secondary_pending = stats_transcription_secondary['pending']
-            
-            # Process jobs if:
-            # 1. At least MIN_PROCESS_INTERVAL seconds have passed since the last processing, or
-            # 2. There are at least MIN_PENDING_JOBS pending jobs
-            # 3. No running jobs
-            if (time_since_last_process >= MIN_PROCESS_INTERVAL or 
-                pending_count >= MIN_PENDING_JOBS or
-                transcription_pending > 0 or
-                transcription_secondary_pending > 0):
-                if running_count > 0:
-                    time.sleep(POLL_INTERVAL)
-                    continue
-                # Check if shutdown is requested before trying to start a new batch of jobs
-                with shutdown_lock:
-                    if shutdown_requested:
-                        logger.info("Shutdown requested quitting worker process...")
-                        break
-                transcription_job_types = []
-                if transcription_pending > 0:
-                    transcription_job_types.append("transcription")
-                if transcription_secondary_pending > 0:
-                    transcription_job_types.append("transcription_secondary")
 
-                if transcription_job_types:
-                    logger.info(f"Processing transcription queues in parallel: {transcription_job_types}")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(transcription_job_types)) as executor:
-                        futures = {
-                            executor.submit(process_job_type_batch, job_type): job_type
-                            for job_type in transcription_job_types
-                        }
-                        for future in concurrent.futures.as_completed(futures):
-                            job_type = futures[future]
-                            try:
-                                processed_count = future.result()
-                                logger.info(f"Finished {job_type} batch with {processed_count} locked jobs")
-                            except Exception as e:
-                                logger.error(f"Parallel {job_type} batch failed: {str(e)}\n{traceback.format_exc()}")
+
+    last_process_time = 0
+    active_transcription_futures: Dict[str, concurrent.futures.Future] = {}
+    transcription_job_types = ("transcription", "transcription_secondary")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(transcription_job_types)) as transcription_executor:
+        while True:
+            # Check if shutdown is requested
+            with shutdown_lock:
+                if shutdown_requested:
+                    logger.info("Shutting down gracefully")
+                    break
+
+            try:
+                completed_job_types = [
+                    job_type
+                    for job_type, future in active_transcription_futures.items()
+                    if future.done()
+                ]
+                for job_type in completed_job_types:
+                    future = active_transcription_futures.pop(job_type)
+                    try:
+                        processed_count = future.result()
+                        logger.info(f"Finished {job_type} batch with {processed_count} locked jobs")
+                    except Exception as e:
+                        logger.error(f"Parallel {job_type} batch failed: {str(e)}\n{traceback.format_exc()}")
                     last_process_time = time.time()
-                else:
-                    processed_count = process_job_type_batch("masking")
-                    if processed_count:
-                        last_process_time = time.time()
+
+                current_time = time.time()
+                time_since_last_process = current_time - last_process_time
+
+                # Get queue stats to check pending job count
+                stats_all = get_queue_stats()
+                stats_transcription = get_queue_stats(job_type="transcription")
+                stats_transcription_secondary = get_queue_stats(job_type="transcription_secondary")
+                pending_count = stats_all['pending']
+                running_count = stats_all['running']
+                transcription_pending = stats_transcription['pending']
+                transcription_secondary_pending = stats_transcription_secondary['pending']
+
+                if transcription_pending > 0 and "transcription" not in active_transcription_futures:
+                    logger.info("Starting transcription batch on GPU0")
+                    active_transcription_futures["transcription"] = transcription_executor.submit(
+                        process_job_type_batch,
+                        "transcription"
+                    )
+                    last_process_time = time.time()
+
+                if transcription_secondary_pending > 0 and "transcription_secondary" not in active_transcription_futures:
+                    logger.info("Starting transcription_secondary batch on GPU1")
+                    active_transcription_futures["transcription_secondary"] = transcription_executor.submit(
+                        process_job_type_batch,
+                        "transcription_secondary"
+                    )
+                    last_process_time = time.time()
+
+                transcription_active = bool(active_transcription_futures)
+                transcription_pending_any = transcription_pending > 0 or transcription_secondary_pending > 0
+
+                # Process masking only when transcription queues are idle; masking still runs as a single batch.
+                if not transcription_active and not transcription_pending_any:
+                    should_process_masking = (
+                        time_since_last_process >= MIN_PROCESS_INTERVAL or
+                        pending_count >= MIN_PENDING_JOBS
+                    )
+                    if should_process_masking:
+                        if running_count > 0:
+                            time.sleep(POLL_INTERVAL)
+                            continue
+                        with shutdown_lock:
+                            if shutdown_requested:
+                                logger.info("Shutdown requested quitting worker process...")
+                                break
+                        processed_count = process_job_type_batch("masking")
+                        if processed_count:
+                            last_process_time = time.time()
+                        else:
+                            time.sleep(POLL_INTERVAL)
                     else:
                         time.sleep(POLL_INTERVAL)
-            else:
-                # Not time to process yet, wait before checking again
+                else:
+                    time.sleep(POLL_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"Unexpected error in main loop: {str(e)}\n{traceback.format_exc()}")
                 time.sleep(POLL_INTERVAL)
-                
-        except Exception as e:
-            logger.error(f"Unexpected error in main loop: {str(e)}\n{traceback.format_exc()}")
-            time.sleep(POLL_INTERVAL)
-    
+
     logger.info("Worker shutdown complete")
 
 if __name__ == "__main__":
