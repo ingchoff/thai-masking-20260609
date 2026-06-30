@@ -304,7 +304,8 @@ def run_transcription_step_batch(
 ) -> Tuple[str, List[Dict]]:
     """Core transcription logic extracted from current script.
     Returns JamAI table ID of the created transcription table."""
-    
+    match = re.search(r":(\d+)(?:/|$)", api_url)
+    port = match.group(1) if match else None
     # Initialize transcription client (if not provided)
     if transcription_client is None:
         transcription_logger.info("Initializing Enhanced Transcription Client...")
@@ -358,7 +359,7 @@ def run_transcription_step_batch(
             transcription_logger.info(f"Using provided suffix. Target table name for this run: '{target_table_id}'")
         else:
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            target_table_id = f"{TARGET_TABLE_PREFIX}{timestamp_str}"
+            target_table_id = f"{TARGET_TABLE_PREFIX}{timestamp_str}_{port}"
             transcription_logger.info(f"Using timestamp suffix. Target table name for this run: '{target_table_id}'")
         
         # Check and delete existing target table
